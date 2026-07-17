@@ -69,22 +69,41 @@ package requires (override with `--force`).
 
 ### Building from source
 
-A `Pkgocifile` can build instead of (or as well as) packing prebuilt trees:
+A `Pkgocifile` can build instead of (or as well as) packing prebuilt trees.
+This is `examples/lua/Pkgocifile`, which packages upstream Lua:
 
 ```dockerfile
-NAME mytool
-VERSION 1.2.3
+NAME lua
+VERSION 5.4.8
+DESCRIPTION Powerful, efficient, lightweight, embeddable scripting language
+LICENSE MIT
+URL https://www.lua.org
+FETCH https://www.lua.org/ftp/lua-${PKGOCI_VERSION}.tar.gz 4f18ddae...629ae
 SOURCE .
-RUN make
+RUN:darwin make macosx -j4
+RUN:linux make linux -j4
+RUN:windows make mingw -j4
+RUN make install INSTALL_TOP=$PWD/out
 OUTPUT ./out
 ```
 
-`pkgoci build` executes the `RUN` steps on the host and packs `OUTPUT` for
-the host platform. With `SOURCE`, the source tree (and its build recipe) is
-published as part of the package, so `pkgoci install` transparently builds
-from source on platforms without prebuilt binaries — and
+`FETCH` downloads a sha256-pinned upstream tarball (cached by digest) and
+extracts it into the build context; `RUN` steps execute on the host
+(`RUN:<os>` limits a step to one OS; `$PKGOCI_OS`/`$PKGOCI_ARCH` are set);
+`OUTPUT` is packed for the host platform. The context itself is never
+modified — fetching and building happen in a scratch copy, like a Docker
+build context.
+
+With `SOURCE`, the post-fetch source tree and its build recipe are published
+as part of the package, so `pkgoci install` transparently builds from source
+on platforms without prebuilt binaries — and
 `pkgoci install -s/--build-from-source` forces it. Signature verification
-happens before any build step runs.
+happens before any build step runs, and `FETCH` digests are recorded in the
+build provenance.
+
+`examples/` packages real software from three ecosystems with this format:
+xz and sqlite (Fedora), jq and lua (Homebrew), ninja and zstd (winget) — all
+built, installed, and run in CI.
 
 ### Signatures
 

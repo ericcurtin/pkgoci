@@ -174,6 +174,31 @@ jobs:
           $B uninstall hello
           $B uninstall libfoo
           test ! -e "$RUNNER_TEMP/prefix/bin/hello"
+      - name: Real-world packages (Fedora, Homebrew, and winget picks)
+        if: matrix.platform == 'linux/amd64'
+        shell: bash
+        run: |
+          export PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=ci PKGOCI_PREFIX="$RUNNER_TEMP/prefix"
+          export PKGOCI_VERIFY_KEY="$RUNNER_TEMP/prefix/keys/pkgoci.pub"
+          B=./${{ matrix.bin }}
+          # Two packages from each ecosystem, built from digest-pinned
+          # upstream sources with the Pkgocifiles in examples/:
+          #   Fedora: xz, sqlite | Homebrew: jq, lua | winget: ninja, zstd
+          for pkg in xz sqlite jq lua ninja zstd; do
+            $B build "examples/$pkg"
+            $B push "$pkg" --sign
+          done
+          $B install xz sqlite jq lua ninja zstd
+          "$RUNNER_TEMP/prefix/bin/xz" --version
+          "$RUNNER_TEMP/prefix/bin/sqlite3" --version
+          "$RUNNER_TEMP/prefix/bin/jq" --version
+          "$RUNNER_TEMP/prefix/bin/lua" -v
+          "$RUNNER_TEMP/prefix/bin/ninja" --version
+          "$RUNNER_TEMP/prefix/bin/zstd" --version
+          $B verify jq | grep -q "build provenance"
+          # Rebuild one from its published source layer (RUN:linux path).
+          $B install lua --force --build-from-source
+          "$RUNNER_TEMP/prefix/bin/lua" -v
       - uses: actions/upload-artifact@v4
         with:
           name: pkgoci-${{ matrix.artifact }}

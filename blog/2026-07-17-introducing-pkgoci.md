@@ -79,20 +79,30 @@ graph lives on the artifacts themselves.
 
 ## It builds from source, too
 
-A `Pkgocifile` doesn't have to pack prebuilt trees — it can build them:
+A `Pkgocifile` doesn't have to pack prebuilt trees — it can build them. This
+is the real recipe for upstream Lua, from the repo's `examples/`:
 
 ```text
-NAME mytool
-VERSION 1.2.3
+NAME lua
+VERSION 5.4.8
+DESCRIPTION Powerful, efficient, lightweight, embeddable scripting language
+LICENSE MIT
+FETCH https://www.lua.org/ftp/lua-${PKGOCI_VERSION}.tar.gz 4f18ddae...629ae
 SOURCE .
-RUN make
+RUN:darwin make macosx -j4
+RUN:linux make linux -j4
+RUN:windows make mingw -j4
+RUN make install INSTALL_TOP=$PWD/out
 OUTPUT ./out
 ```
 
-`pkgoci build` executes the `RUN` steps and packs the result for the host
-platform, and — this is the interesting part — `SOURCE` publishes the source
-tree *and its build recipe* as one more platform entry in the same artifact
-(`source/all`, next to `darwin/arm64` and friends).
+`FETCH` pulls the sha256-pinned upstream tarball (the digest also lands in
+the build provenance), `RUN` steps execute in a scratch copy of the context —
+never mutating it, like a Docker build — and `pkgoci build` packs `OUTPUT`
+for the host platform. And — this is the interesting part — `SOURCE`
+publishes the post-fetch source tree *and its build recipe* as one more
+platform entry in the same artifact (`source/all`, next to `darwin/arm64` and
+friends).
 
 That gives pkgoci the same graceful degradation Homebrew gets from
 build-from-source formulas: on a platform with prebuilt binaries, `install`
@@ -101,6 +111,29 @@ layer, runs the recipe, and installs the result. `pkgoci install -s` forces a
 source build anywhere. And because the source layer and its recipe live under
 the same signed digest as everything else, **signature verification happens
 before a single build step runs**.
+
+### Is the format enough for real software?
+
+To find out, I took two packages from each of three ecosystems — **xz** and
+**sqlite** from Fedora, **jq** and **lua** from Homebrew, **ninja** and
+**zstd** from winget — and packaged all six from their upstream release
+tarballs with nothing but a Pkgocifile each. Every one builds, signs,
+attests, pushes, installs, and runs, on macOS and in CI on Linux (including
+rebuilding Lua from its *published* source layer):
+
+```text
+$ pkgoci install xz sqlite jq lua ninja zstd
+...
+$ jq --version && lua -v && ninja --version
+jq-1.7.1
+Lua 5.4.8  Copyright (C) 1994-2025 Lua.org, PUC-Rio
+1.13.1
+```
+
+Getting there required exactly two additions to the format — `FETCH` (pinned
+upstream sources) and `RUN:<os>` (Lua's `make macosx`/`make linux`/`make
+mingw` build targets) — which is the point of testing against real software
+instead of hello-world.
 
 ## Signatures and build provenance, cosign-verifiable
 

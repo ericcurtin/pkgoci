@@ -27,6 +27,24 @@ pub fn extract_layer(archive: &Path, media_type: &str, dest: &Path) -> Result<()
     Ok(())
 }
 
+/// Extract a `.tar.gz` with the leading path component stripped (like
+/// `tar --strip-components=1`), used for upstream source tarballs.
+pub fn extract_tar_gz_strip1(bytes: &[u8], dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    ar.set_preserve_permissions(true);
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let stripped: std::path::PathBuf = path.components().skip(1).collect();
+        if stripped.as_os_str().is_empty() {
+            continue;
+        }
+        entry.unpack(dest.join(stripped))?;
+    }
+    Ok(())
+}
+
 /// Pack a directory into a `.tar.gz` layer (used by `pkgoci push`).
 pub fn pack_dir(dir: &Path) -> Result<Vec<u8>> {
     let buf = Vec::new();

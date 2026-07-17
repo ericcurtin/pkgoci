@@ -254,13 +254,13 @@ fn install_one(
             std::fs::remove_dir_all(&build_dir)?;
         }
         extract::extract_layer(&cache_file, &layer.media_type, &build_dir)?;
-        let steps: Vec<String> = resolved
-            .manifest
-            .annotation(oci::ANNOTATION_BUILD)
-            .unwrap_or_default()
-            .lines()
-            .map(String::from)
-            .collect();
+        let steps: Vec<crate::pkgocifile::Step> = serde_json::from_str(
+            resolved
+                .manifest
+                .annotation(oci::ANNOTATION_BUILD)
+                .unwrap_or("[]"),
+        )
+        .context("parsing build steps annotation")?;
         if steps.is_empty() {
             bail!("source manifest for {short} has no build steps");
         }
@@ -588,11 +588,39 @@ pub fn build(
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
 
+    // The context stays read-only (like docker build): fetching and building
+    // happen in a scratch copy.
+    let work = if spec.run.is_empty() {
+        context.clone()
+    } else {
+        let staging = cfg
+            .cache()
+            .join(format!("build-{}-{}", spec.name, spec.version));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        copy_tree(&context, &staging)?;
+        staging
+    };
+
+    // Fetch digest-pinned upstream sources into the work tree.
+    for (url, sha) in &spec.fetches {
+        fetch_source(cfg, url, sha, &spec, &work)?;
+    }
+
+    // Pack the (pristine, post-fetch, pre-build) source tree now so the
+    // published source layer never contains build artifacts.
+    let source_bytes = spec
+        .source
+        .as_ref()
+        .map(|rel| extract::pack_dir(&work.join(rel)))
+        .transpose()?;
+
     // Execute RUN steps on the host and pack their OUTPUT for the host
     // platform (like docker build's RUN).
     if !spec.run.is_empty() {
-        run_steps(&spec.run, &context, &spec.name, &spec.version)?;
-        let output = context.join(&spec.output);
+        run_steps(&spec.run, &work, &spec.name, &spec.version)?;
+        let output = work.join(&spec.output);
         if !output.is_dir() {
             bail!(
                 "RUN steps did not produce OUTPUT directory {}",
@@ -678,15 +706,17 @@ pub fn build(
     // Publish the source tree (plus its build recipe) so users on platforms
     // without prebuilt binaries can build from source at install time.
     let mut source_digest_hex = None;
-    if let Some(source_dir) = &spec.source {
-        let src_bytes = extract::pack_dir(source_dir)?;
+    if let Some(src_bytes) = source_bytes {
         let src_size = src_bytes.len() as u64;
         let src_digest = write_blob(&blobs, &src_bytes)?;
         source_digest_hex = Some(src_digest.trim_start_matches("sha256:").to_string());
         println!("Packed source ({})", cellar::human_bytes(src_size));
 
         let mut src_annotations = annotations.clone();
-        src_annotations.insert(oci::ANNOTATION_BUILD.into(), spec.run.join("\n"));
+        src_annotations.insert(
+            oci::ANNOTATION_BUILD.into(),
+            serde_json::to_string(&spec.run)?,
+        );
         src_annotations.insert(oci::ANNOTATION_OUTPUT.into(), spec.output.clone());
         let manifest = oci::Manifest {
             schema_version: 2,
@@ -760,6 +790,12 @@ pub fn build(
     if let Some(hex) = source_digest_hex {
         materials.push(serde_json::json!({"name": "source", "digest": {"sha256": hex}}));
     }
+    for (url, sha) in &spec.fetches {
+        materials.push(serde_json::json!({
+            "name": substitute(url, &spec),
+            "digest": {"sha256": sha}
+        }));
+    }
     let provenance = serde_json::json!({
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{
@@ -793,6 +829,9 @@ pub fn build(
         serde_json::to_vec(&provenance)?,
     )?;
 
+    if work != context {
+        let _ = std::fs::remove_dir_all(&work);
+    }
     println!(
         "Built {} {} ({platforms} platform(s), {index_digest})",
         spec.name, spec.version
@@ -817,10 +856,57 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Run Pkgocifile RUN steps in `dir` with the platform's shell.
-fn run_steps(steps: &[String], dir: &std::path::Path, name: &str, version: &str) -> Result<()> {
-    for step in steps {
-        println!("RUN {step}");
+/// Substitute `${PKGOCI_NAME}`/`${PKGOCI_VERSION}` in FETCH urls.
+fn substitute(url: &str, spec: &crate::pkgocifile::Spec) -> String {
+    url.replace("${PKGOCI_NAME}", &spec.name)
+        .replace("${PKGOCI_VERSION}", &spec.version)
+}
+
+/// Download a digest-pinned source tarball (cached by digest) and extract it
+/// into the build context with the leading path component stripped.
+fn fetch_source(
+    cfg: &Config,
+    url: &str,
+    sha256: &str,
+    spec: &crate::pkgocifile::Spec,
+    context: &std::path::Path,
+) -> Result<()> {
+    use std::io::Read;
+    let url = substitute(url, spec);
+    std::fs::create_dir_all(cfg.cache())?;
+    let cached = cfg.cache().join(format!("fetch-{sha256}.tar.gz"));
+    let bytes = if cached.exists() {
+        std::fs::read(&cached)?
+    } else {
+        println!("FETCH {url}");
+        let mut bytes = Vec::new();
+        ureq::get(&url)
+            .call()
+            .with_context(|| format!("fetching {url}"))?
+            .into_reader()
+            .read_to_end(&mut bytes)?;
+        std::fs::write(&cached, &bytes)?;
+        bytes
+    };
+    let got = oci::sha256_hex(&bytes);
+    if got != sha256 {
+        let _ = std::fs::remove_file(&cached);
+        bail!("digest mismatch for {url}: expected {sha256}, got {got}");
+    }
+    extract::extract_tar_gz_strip1(&bytes, context)
+        .with_context(|| format!("extracting {url} into {}", context.display()))
+}
+
+/// Run Pkgocifile RUN steps in `dir` with the platform's shell, skipping
+/// steps limited to other OSes.
+fn run_steps(
+    steps: &[crate::pkgocifile::Step],
+    dir: &std::path::Path,
+    name: &str,
+    version: &str,
+) -> Result<()> {
+    for step in steps.iter().filter(|s| s.applies_to(crate::platform::os())) {
+        println!("RUN {}", step.cmd);
         let (shell, flag) = if cfg!(windows) {
             ("cmd", "/C")
         } else {
@@ -828,16 +914,16 @@ fn run_steps(steps: &[String], dir: &std::path::Path, name: &str, version: &str)
         };
         let status = std::process::Command::new(shell)
             .arg(flag)
-            .arg(step)
+            .arg(&step.cmd)
             .current_dir(dir)
             .env("PKGOCI_NAME", name)
             .env("PKGOCI_VERSION", version)
             .env("PKGOCI_OS", crate::platform::os())
             .env("PKGOCI_ARCH", crate::platform::arch())
             .status()
-            .with_context(|| format!("running {step:?}"))?;
+            .with_context(|| format!("running {:?}", step.cmd))?;
         if !status.success() {
-            bail!("RUN {step:?} failed with {status}");
+            bail!("RUN {:?} failed with {status}", step.cmd);
         }
     }
     Ok(())

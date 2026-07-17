@@ -1,0 +1,13 @@
+# lua — scripting language (packaged by Homebrew as `lua`)
+NAME lua
+VERSION 5.4.8
+DESCRIPTION Powerful, efficient, lightweight, embeddable scripting language
+LICENSE MIT
+URL https://www.lua.org
+FETCH https://www.lua.org/ftp/lua-${PKGOCI_VERSION}.tar.gz 4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae
+SOURCE .
+RUN:darwin make macosx -j4
+RUN:linux make linux -j4
+RUN:windows make mingw -j4
+RUN make install INSTALL_TOP=$PWD/out
+OUTPUT ./out

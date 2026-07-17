@@ -10,17 +10,39 @@
 //! PLATFORM darwin/arm64 ./out/mac-arm64
 //! PLATFORM linux/amd64 ./out/linux-amd64
 //! # Or build from source (RUN executes on the host at build time; SOURCE is
-//! # published with the package so users on other platforms can build too):
+//! # published with the package so users on other platforms can build too).
+//! # FETCH downloads a digest-pinned upstream tarball into the context, and
+//! # RUN:<os> limits a step to one OS:
+//! FETCH https://example.com/mytool-${PKGOCI_VERSION}.tar.gz <sha256>
 //! SOURCE .
-//! RUN make
+//! RUN:darwin make macosx
+//! RUN:linux make linux
+//! RUN make install INSTALL_TOP=$PWD/out
 //! OUTPUT ./out
 //! ```
+
+use serde::{Deserialize, Serialize};
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
 pub const FILE_NAME: &str = "Pkgocifile";
+
+/// A build step, optionally limited to one OS (`RUN:linux ...`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Step {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    pub cmd: String,
+}
+
+impl Step {
+    /// Does this step apply to the given OS?
+    pub fn applies_to(&self, os: &str) -> bool {
+        self.os.as_deref().is_none_or(|o| o == os)
+    }
+}
 
 pub struct Spec {
     pub name: String,
@@ -32,12 +54,16 @@ pub struct Spec {
     /// (os, arch, payload directory) — paths relative to the Pkgocifile.
     pub platforms: Vec<(String, String, PathBuf)>,
     /// Build commands executed in the Pkgocifile's directory.
-    pub run: Vec<String>,
+    pub run: Vec<Step>,
     /// Directory `run` produces, packed for the host platform
     /// (and used at install time when building from source).
     pub output: String,
-    /// Source tree published with the package for build-from-source installs.
-    pub source: Option<PathBuf>,
+    /// Source tree (relative to the build context) published with the
+    /// package for build-from-source installs.
+    pub source: Option<String>,
+    /// Upstream (url, sha256) tarballs extracted into the context before
+    /// anything else runs.
+    pub fetches: Vec<(String, String)>,
 }
 
 pub fn parse(path: &Path) -> Result<Spec> {
@@ -53,9 +79,10 @@ pub fn parse(path: &Path) -> Result<Spec> {
     let mut url = None;
     let mut requires = Vec::new();
     let mut platforms: Vec<(String, String, PathBuf)> = Vec::new();
-    let mut run = Vec::new();
+    let mut run: Vec<Step> = Vec::new();
     let mut output = "./out".to_string();
     let mut source = None;
+    let mut fetches = Vec::new();
 
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -100,14 +127,39 @@ pub fn parse(path: &Path) -> Result<Spec> {
                 }
                 platforms.push((os.to_string(), arch.to_string(), dir));
             }
-            "RUN" => run.push(rest),
+            "RUN" => run.push(Step {
+                os: None,
+                cmd: rest,
+            }),
             "OUTPUT" => output = rest,
             "SOURCE" => {
-                let dir = base.join(&rest);
-                if !dir.is_dir() {
-                    return Err(err(lineno, format!("no such directory: {}", dir.display())));
+                if !base.join(&rest).is_dir() {
+                    return Err(err(lineno, format!("no such directory: {rest}")));
                 }
-                source = Some(dir);
+                source = Some(rest);
+            }
+            "FETCH" => {
+                let (url, sha) = rest
+                    .split_once(char::is_whitespace)
+                    .ok_or_else(|| err(lineno, "FETCH needs `<url> <sha256>`".into()))?;
+                let sha = sha.trim();
+                if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(err(
+                        lineno,
+                        format!("FETCH sha256 {sha:?} is not a hex digest"),
+                    ));
+                }
+                fetches.push((url.to_string(), sha.to_string()));
+            }
+            run_os if run_os.starts_with("RUN:") => {
+                let os = &run_os[4..];
+                if !["darwin", "linux", "windows"].contains(&os) {
+                    return Err(err(lineno, format!("unknown RUN OS {os:?}")));
+                }
+                run.push(Step {
+                    os: Some(os.to_string()),
+                    cmd: rest,
+                });
             }
             other => return Err(err(lineno, format!("unknown directive {other:?}"))),
         }
@@ -124,6 +176,7 @@ pub fn parse(path: &Path) -> Result<Spec> {
         run,
         output,
         source,
+        fetches,
     };
     if spec.platforms.is_empty() && spec.run.is_empty() {
         bail!(
