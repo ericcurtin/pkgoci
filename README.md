@@ -101,6 +101,19 @@ on platforms without prebuilt binaries — and
 happens before any build step runs, and `FETCH` digests are recorded in the
 build provenance.
 
+### Build sandbox
+
+`RUN` steps never execute directly on your machine:
+
+| OS      | Backend |
+|---------|---------|
+| Linux   | Docker (`--network=none`, work tree mounted, host uid/gid; image from `IMAGE`, default `buildpack-deps:bookworm`) |
+| macOS   | seatbelt (`sandbox-exec`, as Homebrew uses): writes confined to the work tree and temp dirs, network denied |
+| Windows | SAFER "constrained" restricted token; the work tree is ACLed for the RESTRICTED SID |
+
+This applies both to `pkgoci build` and to install-time source builds.
+`PKGOCI_SANDBOX=0` disables it (e.g. Linux hosts without Docker).
+
 `examples/` packages real software from three ecosystems with this format:
 xz and sqlite (Fedora), jq and lua (Homebrew), ninja and zstd (winget) — all
 built, installed, and run in CI.
@@ -128,11 +141,18 @@ cosign verify-attestation --key pkgoci.pub --type slsaprovenance1 \
   --insecure-ignore-tlog=true registry-1.docker.io/pkgoci/mytool@sha256:...
 ```
 
+`push --sign --rekor` additionally records the signature in the **Rekor
+transparency log** (`rekor.sigstore.dev`, or `PKGOCI_REKOR_URL`) and stores
+the receipt with the signature; `pkgoci verify` checks the receipt's Signed
+Entry Timestamp against the log's key and confirms it binds the exact
+signature and payload.
+
 When `PKGOCI_VERIFY_KEY` is set (one key or a directory of trusted keys),
 every install — dependencies included — must carry a signature that verifies
 against a trusted key; missing, mismatched, and tampered signatures all abort
-the install. `pkgoci verify` additionally checks and prints the build
-provenance. Verification is built in: no external tooling is needed.
+the install. `pkgoci verify` additionally checks and prints the transparency
+log receipt and the build provenance. Verification is built in: no external
+tooling is needed.
 
 ### Publishing
 

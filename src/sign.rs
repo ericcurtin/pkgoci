@@ -117,6 +117,14 @@ pub fn sign(key_path: &Path, payload_bytes: &[u8]) -> Result<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(key.sign(payload_bytes).to_bytes()))
 }
 
+/// SPKI PEM of the public half of a signing key (for transparency logs).
+pub fn public_key_pem(key_path: &Path) -> Result<String> {
+    let key = load_signing_key(key_path)?;
+    key.verifying_key()
+        .to_public_key_pem(Default::default())
+        .map_err(|e| anyhow!("encoding public key: {e}"))
+}
+
 /// DSSE pre-authentication encoding: what is actually signed for envelopes.
 fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut out = format!(

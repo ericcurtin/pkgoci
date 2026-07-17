@@ -6,7 +6,9 @@ mod oci;
 mod pkgocifile;
 mod platform;
 mod registry;
+mod rekor;
 mod resolve;
+mod sandbox;
 mod sign;
 
 use anyhow::Result;
@@ -76,6 +78,9 @@ enum Cmd {
         /// Sign the package with the key from `pkgoci keygen`
         #[arg(long)]
         sign: bool,
+        /// Record the signature in the Rekor transparency log
+        #[arg(long)]
+        rekor: bool,
     },
     /// Generate an ed25519 signing keypair
     Keygen {
@@ -98,6 +103,20 @@ fn main() {
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    // Internal Windows sandbox helper: `pkgoci __sandbox-exec <dir> <cmd>`.
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() == 4 && args[1] == "__sandbox-exec" {
+            match sandbox::windows_exec_restricted(std::path::Path::new(&args[2]), &args[3]) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
@@ -126,7 +145,11 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Build { path, file } => commands::build(&cfg, path, file),
-        Cmd::Push { package, sign } => commands::push(&cfg, package, sign),
+        Cmd::Push {
+            package,
+            sign,
+            rekor,
+        } => commands::push(&cfg, package, sign, rekor),
         Cmd::Keygen { out } => commands::keygen(&cfg, out),
         Cmd::Verify { package, key } => commands::verify(&cfg, package, key),
     }

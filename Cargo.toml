@@ -23,9 +23,18 @@ rand = "0.8"
 semver = "1"
 pubgrub = "0.2"
 base64 = "0.22"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_AppLocker",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 lto = "thin"

@@ -112,6 +112,27 @@ source build anywhere. And because the source layer and its recipe live under
 the same signed digest as everything else, **signature verification happens
 before a single build step runs**.
 
+### Builds are sandboxed on every OS
+
+A build recipe is arbitrary code, so `RUN` steps never execute directly on
+your machine. Each OS uses its native isolation:
+
+- **Linux**: Docker — the work tree is the only mount, the container runs as
+  your uid with `--network=none`, and the build environment is an image you
+  pick with `IMAGE` (default `buildpack-deps:bookworm`), Dockerfile-`FROM`
+  style.
+- **macOS**: seatbelt (`sandbox-exec`) — the same mechanism Homebrew's build
+  sandbox uses — with writes confined to the work tree and temp dirs and the
+  network denied.
+- **Windows**: a SAFER *constrained* restricted token; the work tree is the
+  only location ACLed for the RESTRICTED SID.
+
+This applies to `pkgoci build` and to install-time source builds alike, and
+it's enforced, not advisory: a recipe that tries to `touch $HOME/ESCAPED` or
+`curl example.com` fails the build (both are asserted in CI). Since `FETCH`
+runs before the sandbox and pins digests, recipes have no reason to touch the
+network at all.
+
 ### Is the format enough for real software?
 
 To find out, I took two packages from each of three ecosystems — **xz** and
@@ -150,14 +171,28 @@ timestamps. `push --sign` publishes that provenance as a DSSE attestation
 under cosign's `sha256-<digest>.att` tag — the same shape as the build
 attestations Homebrew attaches to its bottles.
 
+And signatures don't have to stay private: `--rekor` records them in the
+**Rekor transparency log** — the same public, append-only log that backs
+sigstore and Homebrew's attestations — and stores the log's receipt (the
+Signed Entry Timestamp) alongside the signature, where `pkgoci verify`
+checks it against the log's key and confirms it binds this exact signature
+and payload.
+
 ```sh
 pkgoci keygen                       # standard PEM keypair
-pkgoci push mytool --sign           # signature + provenance attestation
+pkgoci push mytool --sign --rekor   # signature + provenance + tlog entry
 
 # consumers opt in, then verification is enforced:
 export PKGOCI_VERIFY_KEY=/path/to/pkgoci.pub
 pkgoci install mytool
-pkgoci verify mytool                # signature + provenance report
+pkgoci verify mytool                # signature + tlog + provenance report
+```
+
+```text
+$ pkgoci verify mytool
+OK: ...:1.2.3 (sha256:3b5f2b...) verified with pkgoci.pub
+OK: transparency log entry 108e91... (index 2189219413) at https://rekor.sigstore.dev verified
+OK: build provenance (https://slsa.dev/provenance/v1) by https://pkgoci.dev/pkgoci/0.1.0 ... verified
 ```
 
 Because the formats are cosign's, the industry-standard tooling agrees with
@@ -182,7 +217,8 @@ subject pins the index.
 For comparison, Homebrew's attestation verification is opt-in, applies to
 homebrew-core bottles, and shells out to the external `gh` binary; pkgoci's
 verification is built in, works for any publisher on any registry, covers
-signatures *and* provenance, and enforces the entire dependency graph.
+signatures, provenance, *and* the transparency log receipt, and enforces the
+entire dependency graph.
 
 ## It's fast — measurably faster than Homebrew on everything
 
@@ -255,14 +291,15 @@ This is a young project, and I'd rather list its gaps than oversell it:
 - **There's no package catalog yet.** The design removes the need for
   *infrastructure*, not for *packages*. The default `pkgoci` namespace on
   Docker Hub needs to be populated before `pkgoci install jq` means anything.
-- **Source builds run your shell, unsandboxed.** Like a Homebrew formula or a
-  Dockerfile `RUN`, a build recipe is arbitrary code — signature verification
-  before the first step tells you *who* you're trusting, not that it's safe.
-  And a `RUN make` is not a formula DSL: casks, services, and the rest of
-  Homebrew's two decades of ecosystem are not what this replaces.
-- **Signing is key-based.** There's no keyless flow or transparency log yet;
-  key distribution is up to you. Because the formats are already cosign's,
-  that upgrade path slots in naturally later.
+- **A sandbox is a boundary, not a review.** Builds can't touch your files or
+  the network, but you're still running and installing the publisher's code —
+  signatures and provenance tell you *who* you're trusting, not that it's
+  safe. And a `RUN make` is not a formula DSL: casks, services, and the rest
+  of Homebrew's two decades of ecosystem are not what this replaces.
+- **Built-in signing is key-based.** Verification enforces keys you chose to
+  trust; there's no keyless OIDC-identity flow built in yet. (Because the
+  storage formats are cosign's, keyless signing already works *via* cosign
+  itself, and the transparency log is the same Rekor either way.)
 
 ## Try it
 

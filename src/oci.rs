@@ -17,6 +17,10 @@ pub const ANNOTATION_REQUIRES: &str = "dev.pkgoci.requires";
 pub const ANNOTATION_BUILD: &str = "dev.pkgoci.build";
 /// Directory the build commands produce, relative to the source root.
 pub const ANNOTATION_OUTPUT: &str = "dev.pkgoci.output";
+/// Container image for sandboxed Linux builds.
+pub const ANNOTATION_IMAGE: &str = "dev.pkgoci.image";
+/// Rekor transparency log receipt (JSON) for the signature.
+pub const ANNOTATION_REKOR: &str = "dev.pkgoci.rekor";
 
 /// Pseudo-platform for the published source tree.
 pub const SOURCE_OS: &str = "source";

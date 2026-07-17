@@ -93,6 +93,19 @@ jobs:
           ./${{ matrix.bin }} prefix
           ./${{ matrix.bin }} list
           ./${{ matrix.bin }} update
+      - name: Sandboxed build smoke test (windows restricted token)
+        if: matrix.platform == 'windows/amd64'
+        shell: bash
+        run: |
+          export PKGOCI_PREFIX="$RUNNER_TEMP/prefix"
+          B=./${{ matrix.bin }}
+          mkdir -p winpkg/src
+          printf '#include <stdio.h>\nint main(void){puts("sandboxed");return 0;}\n' > winpkg/src/hi.c
+          printf '%s\n' 'NAME winhello' 'VERSION 1.0.0' \
+            'RUN:windows mkdir out\bin && gcc src/hi.c -o out/bin/hi.exe' \
+            'OUTPUT ./out' > winpkg/Pkgocifile
+          $B build winpkg 2>&1 | tee build.log
+          grep -q "Sandbox: restricted token" build.log
       - name: Install cosign (interop check)
         if: startsWith(matrix.platform, 'linux')
         uses: sigstore/cosign-installer@v3
@@ -157,6 +170,15 @@ jobs:
           "$RUNNER_TEMP/prefix/bin/srchello" | grep -q compiled
           $B install srchello --force --build-from-source
           "$RUNNER_TEMP/prefix/bin/srchello" | grep -q compiled
+          # Source builds run inside the docker sandbox: no network, and
+          # writes confined to the mounted work tree.
+          $B build /tmp/src 2>&1 | grep -q "Sandbox: docker"
+          mkdir -p /tmp/evil
+          printf 'NAME evil\nVERSION 1.0.0\nRUN mkdir -p out && curl -fsS --max-time 5 https://example.com -o out/x\nOUTPUT ./out\n' > /tmp/evil/Pkgocifile
+          if $B build /tmp/evil; then echo "network in sandbox must fail"; exit 1; fi
+          # Transparency log: record in public Rekor and verify the receipt.
+          $B push srchello --sign --rekor
+          $B verify srchello | grep -q "transparency log entry"
           # Signature + SLSA provenance verify with pkgoci and stock cosign.
           $B verify srchello | grep -q "build provenance"
           DIGEST=$(cosign verify --key "$PKGOCI_VERIFY_KEY" --insecure-ignore-tlog=true \

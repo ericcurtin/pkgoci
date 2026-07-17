@@ -127,23 +127,35 @@ fn verify_signature(cfg: &Config, client: &Client, repo: &str, resolved: &Resolv
     let Some(trust_root) = cfg.verify_key() else {
         return Ok(());
     };
-    let key = check_signature(client, repo, resolved, &trust_root)?;
+    let check = check_signature(client, repo, resolved, &trust_root)?;
     println!(
         "Verified {repo} ({}) with {}",
         resolved.root_digest,
-        key.display()
+        check.key.display()
     );
     Ok(())
 }
 
+/// Outcome of a successful signature check.
+struct SignatureCheck {
+    /// Trusted key that matched.
+    key: std::path::PathBuf,
+    /// The verified base64 signature.
+    signature_b64: String,
+    /// sha256 (hex) of the signed simple-signing payload.
+    payload_sha256: String,
+    /// Rekor receipt stored with the signature, if any.
+    rekor: Option<crate::rekor::Entry>,
+}
+
 /// Verify the cosign-format signature artifact for `resolved` against the
-/// keys in `trust_root`. Returns the path of the key that matched.
+/// keys in `trust_root`.
 fn check_signature(
     client: &Client,
     repo: &str,
     resolved: &Resolved,
     trust_root: &std::path::Path,
-) -> Result<std::path::PathBuf> {
+) -> Result<SignatureCheck> {
     let trusted = sign::load_trusted_keys(trust_root)?;
     let tag = sign::sig_tag(&resolved.root_digest);
     let sig = client
@@ -181,7 +193,21 @@ fn check_signature(
             continue;
         }
         match sign::verify(&trusted, &payload_bytes, signature_b64) {
-            Ok(key) => return Ok(key),
+            Ok(key) => {
+                let rekor = layer
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(oci::ANNOTATION_REKOR))
+                    .map(|j| serde_json::from_str(j))
+                    .transpose()
+                    .context("parsing rekor receipt annotation")?;
+                return Ok(SignatureCheck {
+                    key,
+                    signature_b64: signature_b64.clone(),
+                    payload_sha256: oci::sha256_hex(&payload_bytes),
+                    rekor,
+                });
+            }
             Err(e) => last_err = e,
         }
     }
@@ -264,7 +290,11 @@ fn install_one(
         if steps.is_empty() {
             bail!("source manifest for {short} has no build steps");
         }
-        run_steps(&steps, &build_dir, &short, &version)?;
+        let image = resolved
+            .manifest
+            .annotation(oci::ANNOTATION_IMAGE)
+            .unwrap_or(crate::sandbox::DEFAULT_IMAGE);
+        run_steps(&steps, &build_dir, &short, &version, image)?;
         let output = build_dir.join(
             resolved
                 .manifest
@@ -619,7 +649,7 @@ pub fn build(
     // Execute RUN steps on the host and pack their OUTPUT for the host
     // platform (like docker build's RUN).
     if !spec.run.is_empty() {
-        run_steps(&spec.run, &work, &spec.name, &spec.version)?;
+        run_steps(&spec.run, &work, &spec.name, &spec.version, &spec.image)?;
         let output = work.join(&spec.output);
         if !output.is_dir() {
             bail!(
@@ -718,6 +748,7 @@ pub fn build(
             serde_json::to_string(&spec.run)?,
         );
         src_annotations.insert(oci::ANNOTATION_OUTPUT.into(), spec.output.clone());
+        src_annotations.insert(oci::ANNOTATION_IMAGE.into(), spec.image.clone());
         let manifest = oci::Manifest {
             schema_version: 2,
             media_type: Some(oci::MT_OCI_MANIFEST.into()),
@@ -897,25 +928,19 @@ fn fetch_source(
         .with_context(|| format!("extracting {url} into {}", context.display()))
 }
 
-/// Run Pkgocifile RUN steps in `dir` with the platform's shell, skipping
+/// Run Pkgocifile RUN steps in `dir` inside the platform sandbox, skipping
 /// steps limited to other OSes.
 fn run_steps(
     steps: &[crate::pkgocifile::Step],
     dir: &std::path::Path,
     name: &str,
     version: &str,
+    image: &str,
 ) -> Result<()> {
+    println!("Sandbox: {}", crate::sandbox::describe(image));
     for step in steps.iter().filter(|s| s.applies_to(crate::platform::os())) {
         println!("RUN {}", step.cmd);
-        let (shell, flag) = if cfg!(windows) {
-            ("cmd", "/C")
-        } else {
-            ("sh", "-c")
-        };
-        let status = std::process::Command::new(shell)
-            .arg(flag)
-            .arg(&step.cmd)
-            .current_dir(dir)
+        let status = crate::sandbox::command(&step.cmd, dir, image)?
             .env("PKGOCI_NAME", name)
             .env("PKGOCI_VERSION", version)
             .env("PKGOCI_OS", crate::platform::os())
@@ -974,7 +999,10 @@ fn read_blob(dir: &std::path::Path, digest: &str) -> Result<Vec<u8>> {
 
 /// Push a built package from the local store to the registry
 /// (like `docker push`).
-pub fn push(cfg: &Config, package: String, sign_it: bool) -> Result<()> {
+pub fn push(cfg: &Config, package: String, sign_it: bool, rekor_it: bool) -> Result<()> {
+    if rekor_it && !sign_it {
+        bail!("--rekor requires --sign");
+    }
     let (name, version) = parse_requirement(&package);
     let short = short_name(&package);
     let version = match version {
@@ -1055,7 +1083,24 @@ pub fn push(cfg: &Config, package: String, sign_it: bool) -> Result<()> {
         let _ = std::fs::remove_file(&payload_path);
 
         let mut sig_annotations = oci::Annotations::new();
-        sig_annotations.insert(sign::ANNOTATION_SIGNATURE.into(), signature_b64);
+        sig_annotations.insert(sign::ANNOTATION_SIGNATURE.into(), signature_b64.clone());
+
+        // Record the signature in the Rekor transparency log and store the
+        // receipt with the signature.
+        if rekor_it {
+            let rekor_url = crate::rekor::url();
+            let entry = crate::rekor::upload(
+                &rekor_url,
+                &payload_bytes,
+                &signature_b64,
+                &sign::public_key_pem(&cfg.signing_key())?,
+            )?;
+            println!(
+                "Recorded in transparency log: {} (index {}, {})",
+                rekor_url, entry.log_index, entry.uuid
+            );
+            sig_annotations.insert(oci::ANNOTATION_REKOR.into(), serde_json::to_string(&entry)?);
+        }
         let sig_manifest = oci::Manifest {
             schema_version: 2,
             media_type: Some(oci::MT_OCI_MANIFEST.into()),
@@ -1147,13 +1192,25 @@ pub fn verify(cfg: &Config, package: String, key: Option<std::path::PathBuf>) ->
     let repo = cfg.repo_for(&name);
     let client = Client::new(&cfg.registry);
     let resolved = client.resolve(&repo, &tag)?;
-    let matched = check_signature(&client, &repo, &resolved, &trust_root)?;
+    let check = check_signature(&client, &repo, &resolved, &trust_root)?;
     println!(
         "OK: {}/{repo}:{tag} ({}) verified with {}",
         cfg.registry,
         resolved.root_digest,
-        matched.display()
+        check.key.display()
     );
+
+    // Transparency log receipt (optional but reported and verified).
+    match &check.rekor {
+        None => println!("No transparency log receipt."),
+        Some(entry) => {
+            crate::rekor::verify(entry, &check.signature_b64, &check.payload_sha256)?;
+            println!(
+                "OK: transparency log entry {} (index {}) at {} verified",
+                entry.uuid, entry.log_index, entry.url
+            );
+        }
+    }
 
     // Build provenance attestation (optional but reported).
     match client.resolve(&repo, &sign::att_tag(&resolved.root_digest)) {

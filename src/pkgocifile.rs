@@ -64,6 +64,8 @@ pub struct Spec {
     /// Upstream (url, sha256) tarballs extracted into the context before
     /// anything else runs.
     pub fetches: Vec<(String, String)>,
+    /// Container image for sandboxed Linux builds (like Dockerfile FROM).
+    pub image: String,
 }
 
 pub fn parse(path: &Path) -> Result<Spec> {
@@ -83,6 +85,7 @@ pub fn parse(path: &Path) -> Result<Spec> {
     let mut output = "./out".to_string();
     let mut source = None;
     let mut fetches = Vec::new();
+    let mut image = crate::sandbox::DEFAULT_IMAGE.to_string();
 
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -132,6 +135,7 @@ pub fn parse(path: &Path) -> Result<Spec> {
                 cmd: rest,
             }),
             "OUTPUT" => output = rest,
+            "IMAGE" => image = rest,
             "SOURCE" => {
                 if !base.join(&rest).is_dir() {
                     return Err(err(lineno, format!("no such directory: {rest}")));
@@ -177,6 +181,7 @@ pub fn parse(path: &Path) -> Result<Spec> {
         output,
         source,
         fetches,
+        image,
     };
     if spec.platforms.is_empty() && spec.run.is_empty() {
         bail!(
