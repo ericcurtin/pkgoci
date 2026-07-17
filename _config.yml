@@ -1,0 +1,13 @@
+title: pkgoci
+description: >-
+  Fast, native package manager backed by OCI registries
+  (Docker Hub by default), for macOS, Linux, and Windows.
+theme: jekyll-theme-primer
+exclude:
+  - target
+  - go
+  - src
+  - bench
+  - Cargo.toml
+  - Cargo.lock
+  - build.rs
