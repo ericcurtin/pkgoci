@@ -77,44 +77,79 @@ Receipts remember the edges, so `pkgoci uninstall libfoo` refuses to strand a
 package that still needs it. No lockfile server, no dependency database: the
 graph lives on the artifacts themselves.
 
-## Signatures cosign can verify
+## It builds from source, too
+
+A `Pkgocifile` doesn't have to pack prebuilt trees — it can build them:
+
+```text
+NAME mytool
+VERSION 1.2.3
+SOURCE .
+RUN make
+OUTPUT ./out
+```
+
+`pkgoci build` executes the `RUN` steps and packs the result for the host
+platform, and — this is the interesting part — `SOURCE` publishes the source
+tree *and its build recipe* as one more platform entry in the same artifact
+(`source/all`, next to `darwin/arm64` and friends).
+
+That gives pkgoci the same graceful degradation Homebrew gets from
+build-from-source formulas: on a platform with prebuilt binaries, `install`
+downloads them; on a platform without, it transparently fetches the source
+layer, runs the recipe, and installs the result. `pkgoci install -s` forces a
+source build anywhere. And because the source layer and its recipe live under
+the same signed digest as everything else, **signature verification happens
+before a single build step runs**.
+
+## Signatures and build provenance, cosign-verifiable
 
 Signing follows the same rule — no new infrastructure, and no new formats.
 pkgoci signs the sigstore *simple signing* payload with an ed25519 key and
 stores it in the registry, next to the package, using cosign's storage
 convention (the `sha256-<digest>.sig` tag and
-`dev.cosignproject.cosign/signature` annotation):
+`dev.cosignproject.cosign/signature` annotation).
+
+And because `pkgoci build` is the thing that builds the package, it records
+**SLSA v1 build provenance** while doing so: an in-toto statement pinning the
+Pkgocifile digest, the source digest, the exact build steps, the builder, and
+timestamps. `push --sign` publishes that provenance as a DSSE attestation
+under cosign's `sha256-<digest>.att` tag — the same shape as the build
+attestations Homebrew attaches to its bottles.
 
 ```sh
 pkgoci keygen                       # standard PEM keypair
-pkgoci push mytool --sign
+pkgoci push mytool --sign           # signature + provenance attestation
 
 # consumers opt in, then verification is enforced:
 export PKGOCI_VERIFY_KEY=/path/to/pkgoci.pub
 pkgoci install mytool
-pkgoci verify mytool                # explicit check
+pkgoci verify mytool                # signature + provenance report
 ```
 
-Because the format is cosign's, the industry-standard tooling agrees with us:
+Because the formats are cosign's, the industry-standard tooling agrees with
+us on both:
 
 ```sh
 $ cosign verify --key pkgoci.pub --insecure-ignore-tlog=true .../mytool:1.2.3
-The following checks were performed on each of these signatures:
-  - The cosign claims were validated
+  - The signatures were verified against the specified public key
+$ cosign verify-attestation --key pkgoci.pub --type slsaprovenance1 \
+    --insecure-ignore-tlog=true .../mytool@sha256:...
   - The signatures were verified against the specified public key
 ```
 
 With `PKGOCI_VERIFY_KEY` set (a key, or a directory of trusted keys),
 installs **fail closed**: a missing signature, a signature from an untrusted
 key, or a tampered artifact aborts the install — for every dependency in the
-plan, not just the package you asked for. The digest chain does the rest: the
-signature covers the index, the index pins the manifests, the manifests pin
-the blobs.
+plan, not just the package you asked for, and before any source build step
+executes. The digest chain does the rest: the signature covers the index, the
+index pins the manifests, the manifests pin the blobs, and the provenance
+subject pins the index.
 
 For comparison, Homebrew's attestation verification is opt-in, applies to
 homebrew-core bottles, and shells out to the external `gh` binary; pkgoci's
-verification is built in, works for any publisher on any registry, and
-enforces the entire dependency graph.
+verification is built in, works for any publisher on any registry, covers
+signatures *and* provenance, and enforces the entire dependency graph.
 
 ## It's fast — measurably faster than Homebrew on everything
 
@@ -169,12 +204,13 @@ pkgoci build              # like docker build: Pkgocifile -> local store
 pkgoci push mytool --sign # like docker push: local store -> registry
 ```
 
-`build` packs each platform tree into a layer and writes a standard **OCI
-image layout** into the local store — every blob content-addressed, so the
-digest `build` prints is exactly the digest `push` tags and signs. `push`
-uploads it to any registry you have credentials for, as an image index tagged
-`1.2.3` and `latest`, plus the cosign-format signature. Your users then
-`PKGOCI_NAMESPACE=yourname pkgoci install mytool`.
+`build` runs any `RUN` steps, packs each platform tree into a layer, records
+the build provenance, and writes a standard **OCI image layout** into the
+local store — every blob content-addressed, so the digest `build` prints is
+exactly the digest `push` tags, signs, and attests. `push` uploads it to any
+registry you have credentials for, as an image index tagged `1.2.3` and
+`latest`, plus the cosign-format signature and provenance attestation. Your
+users then `PKGOCI_NAMESPACE=yourname pkgoci install mytool`.
 
 Distribution, hosting, bandwidth, auth, mirrors: all outsourced to registry
 operators who already solved those problems for containers.
@@ -186,12 +222,14 @@ This is a young project, and I'd rather list its gaps than oversell it:
 - **There's no package catalog yet.** The design removes the need for
   *infrastructure*, not for *packages*. The default `pkgoci` namespace on
   Docker Hub needs to be populated before `pkgoci install jq` means anything.
-- **It distributes binaries; it doesn't build them.** There is no
-  build-from-source path, no formula DSL, no casks or services — Homebrew's
-  two decades of ecosystem are not what this replaces.
+- **Source builds run your shell, unsandboxed.** Like a Homebrew formula or a
+  Dockerfile `RUN`, a build recipe is arbitrary code — signature verification
+  before the first step tells you *who* you're trusting, not that it's safe.
+  And a `RUN make` is not a formula DSL: casks, services, and the rest of
+  Homebrew's two decades of ecosystem are not what this replaces.
 - **Signing is key-based.** There's no keyless flow or transparency log yet;
-  key distribution is up to you. Because the format is already cosign's, that
-  upgrade path slots in naturally later.
+  key distribution is up to you. Because the formats are already cosign's,
+  that upgrade path slots in naturally later.
 
 ## Try it
 

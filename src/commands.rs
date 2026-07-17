@@ -29,12 +29,13 @@ fn short_name(spec: &str) -> String {
 
 // ---------------------------------------------------------------- install
 
-pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
+pub fn install(cfg: &Config, packages: Vec<String>, force: bool, from_source: bool) -> Result<()> {
     if packages.is_empty() {
         bail!("no packages given");
     }
     let start = Instant::now();
     let client = Client::new(&cfg.registry);
+    let requested: HashSet<String> = packages.iter().map(|s| short_name(s)).collect();
 
     // Sort requests into version-solver roots (semver constraints, or
     // unconstrained) and direct tag installs (explicit non-semver tags, or
@@ -82,6 +83,18 @@ pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
             None => client.resolve(&cfg.repo_for(&name), &version)?,
         };
         plan.push((format!("{name}@{version}"), resolved));
+    }
+
+    // --build-from-source: use the published source for requested packages.
+    if from_source {
+        for (spec, resolved) in &mut plan {
+            if requested.contains(&short_name(spec)) {
+                let (name, tag) = parse_spec(spec);
+                *resolved = client
+                    .resolve_source(&cfg.repo_for(&name), &tag)
+                    .map_err(|_| anyhow!("{spec} has no published source to build from"))?;
+            }
+        }
     }
 
     let failures = std::thread::scope(|s| {
@@ -223,7 +236,7 @@ fn install_one(
         client.download_blob(&repo, &tag, &layer, &cache_file)?;
     }
 
-    // Extract into the keg.
+    // Extract into the keg (building from source first when needed).
     let keg = cellar::keg_path(cfg, &short, &version);
     if keg.exists() {
         // Unlink a previous install of the same version before replacing it.
@@ -232,7 +245,43 @@ fn install_one(
         }
         std::fs::remove_dir_all(&keg)?;
     }
-    extract::extract_layer(&cache_file, &layer.media_type, &keg)?;
+    if resolved.from_source {
+        println!("Building {short} {version} from source...");
+        let build_dir = cfg
+            .cache()
+            .join(format!("build-{short}-{version}-{}", std::process::id()));
+        if build_dir.exists() {
+            std::fs::remove_dir_all(&build_dir)?;
+        }
+        extract::extract_layer(&cache_file, &layer.media_type, &build_dir)?;
+        let steps: Vec<String> = resolved
+            .manifest
+            .annotation(oci::ANNOTATION_BUILD)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        if steps.is_empty() {
+            bail!("source manifest for {short} has no build steps");
+        }
+        run_steps(&steps, &build_dir, &short, &version)?;
+        let output = build_dir.join(
+            resolved
+                .manifest
+                .annotation(oci::ANNOTATION_OUTPUT)
+                .unwrap_or("out"),
+        );
+        if !output.is_dir() {
+            bail!(
+                "build did not produce output directory {}",
+                output.display()
+            );
+        }
+        copy_tree(&output, &keg)?;
+        std::fs::remove_dir_all(&build_dir)?;
+    } else {
+        extract::extract_layer(&cache_file, &layer.media_type, &keg)?;
+    }
 
     // Remove any other installed version's links, then link the new keg.
     for old_version in cellar::installed_versions(cfg, &short) {
@@ -467,6 +516,7 @@ pub fn upgrade(cfg: &Config, packages: Vec<String>) -> Result<()> {
         cfg,
         outdated.iter().map(|(n, _)| n.clone()).collect(),
         false,
+        false,
     )?;
     for (name, old_version) in outdated {
         if cellar::installed_versions(cfg, &name).len() > 1 {
@@ -530,8 +580,32 @@ pub fn build(
     path: std::path::PathBuf,
     file: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    let started = rfc3339_now();
     let pkgocifile = file.unwrap_or_else(|| path.join(crate::pkgocifile::FILE_NAME));
-    let spec = crate::pkgocifile::parse(&pkgocifile)?;
+    let mut spec = crate::pkgocifile::parse(&pkgocifile)?;
+    let context = pkgocifile
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+
+    // Execute RUN steps on the host and pack their OUTPUT for the host
+    // platform (like docker build's RUN).
+    if !spec.run.is_empty() {
+        run_steps(&spec.run, &context, &spec.name, &spec.version)?;
+        let output = context.join(&spec.output);
+        if !output.is_dir() {
+            bail!(
+                "RUN steps did not produce OUTPUT directory {}",
+                output.display()
+            );
+        }
+        let (os, arch) = (
+            crate::platform::os().to_string(),
+            crate::platform::arch().to_string(),
+        );
+        spec.platforms.retain(|(o, a, _)| (o, a) != (&os, &arch));
+        spec.platforms.push((os, arch, output));
+    }
 
     let out = cfg.store().join(&spec.name).join(&spec.version);
     if out.exists() {
@@ -600,6 +674,53 @@ pub fn build(
     }
 
     let platforms = manifests.len();
+
+    // Publish the source tree (plus its build recipe) so users on platforms
+    // without prebuilt binaries can build from source at install time.
+    let mut source_digest_hex = None;
+    if let Some(source_dir) = &spec.source {
+        let src_bytes = extract::pack_dir(source_dir)?;
+        let src_size = src_bytes.len() as u64;
+        let src_digest = write_blob(&blobs, &src_bytes)?;
+        source_digest_hex = Some(src_digest.trim_start_matches("sha256:").to_string());
+        println!("Packed source ({})", cellar::human_bytes(src_size));
+
+        let mut src_annotations = annotations.clone();
+        src_annotations.insert(oci::ANNOTATION_BUILD.into(), spec.run.join("\n"));
+        src_annotations.insert(oci::ANNOTATION_OUTPUT.into(), spec.output.clone());
+        let manifest = oci::Manifest {
+            schema_version: 2,
+            media_type: Some(oci::MT_OCI_MANIFEST.into()),
+            config: oci::Descriptor {
+                media_type: oci::MT_OCI_CONFIG.into(),
+                digest: config_digest.clone(),
+                size: 2,
+                platform: None,
+                annotations: None,
+            },
+            layers: vec![oci::Descriptor {
+                media_type: oci::MT_LAYER_TAR_GZIP.into(),
+                digest: src_digest,
+                size: src_size,
+                platform: None,
+                annotations: None,
+            }],
+            annotations: Some(src_annotations),
+        };
+        let manifest_json = serde_json::to_vec(&manifest)?;
+        let manifest_digest = write_blob(&blobs, &manifest_json)?;
+        manifests.push(oci::Descriptor {
+            media_type: oci::MT_OCI_MANIFEST.into(),
+            digest: manifest_digest,
+            size: manifest_json.len() as u64,
+            platform: Some(oci::Platform {
+                os: oci::SOURCE_OS.into(),
+                architecture: oci::SOURCE_ARCH.into(),
+            }),
+            annotations: None,
+        });
+    }
+
     let index = oci::Index {
         schema_version: 2,
         media_type: Some(oci::MT_OCI_INDEX.into()),
@@ -629,12 +750,120 @@ pub fn build(
     };
     std::fs::write(out.join("index.json"), serde_json::to_vec(&layout_index)?)?;
 
+    // SLSA v1 build provenance for the package, signed and pushed as a DSSE
+    // attestation by `pkgoci push --sign`.
+    let pkgocifile_bytes = std::fs::read(&pkgocifile)?;
+    let mut materials = vec![serde_json::json!({
+        "name": crate::pkgocifile::FILE_NAME,
+        "digest": {"sha256": oci::sha256_hex(&pkgocifile_bytes)}
+    })];
+    if let Some(hex) = source_digest_hex {
+        materials.push(serde_json::json!({"name": "source", "digest": {"sha256": hex}}));
+    }
+    let provenance = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{
+            "name": spec.name,
+            "digest": {"sha256": index_digest.trim_start_matches("sha256:")}
+        }],
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "predicate": {
+            "buildDefinition": {
+                "buildType": "https://pkgoci.dev/Pkgocifile/v1",
+                "externalParameters": {
+                    "name": spec.name,
+                    "version": spec.version,
+                    "run": spec.run,
+                    "requires": spec.requires,
+                },
+                "resolvedDependencies": materials,
+            },
+            "runDetails": {
+                "builder": {"id": concat!("https://pkgoci.dev/pkgoci/", env!("CARGO_PKG_VERSION"))},
+                "metadata": {
+                    "invocationId": format!("{}-{}", cellar::now_unix(), std::process::id()),
+                    "startedOn": started,
+                    "finishedOn": rfc3339_now(),
+                },
+            },
+        },
+    });
+    std::fs::write(
+        out.join("provenance.json"),
+        serde_json::to_vec(&provenance)?,
+    )?;
+
     println!(
         "Built {} {} ({platforms} platform(s), {index_digest})",
         spec.name, spec.version
     );
     println!("Push it with: pkgoci push {}@{}", spec.name, spec.version);
     Ok(())
+}
+
+/// Recursively copy a directory tree (permissions preserved by fs::copy).
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Run Pkgocifile RUN steps in `dir` with the platform's shell.
+fn run_steps(steps: &[String], dir: &std::path::Path, name: &str, version: &str) -> Result<()> {
+    for step in steps {
+        println!("RUN {step}");
+        let (shell, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        let status = std::process::Command::new(shell)
+            .arg(flag)
+            .arg(step)
+            .current_dir(dir)
+            .env("PKGOCI_NAME", name)
+            .env("PKGOCI_VERSION", version)
+            .env("PKGOCI_OS", crate::platform::os())
+            .env("PKGOCI_ARCH", crate::platform::arch())
+            .status()
+            .with_context(|| format!("running {step:?}"))?;
+        if !status.success() {
+            bail!("RUN {step:?} failed with {status}");
+        }
+    }
+    Ok(())
+}
+
+/// RFC 3339 UTC timestamp without external crates.
+fn rfc3339_now() -> String {
+    let secs = cellar::now_unix() as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 fn write_blob(blobs: &std::path::Path, bytes: &[u8]) -> Result<String> {
@@ -767,6 +996,50 @@ pub fn push(cfg: &Config, package: String, sign_it: bool) -> Result<()> {
             &serde_json::to_string(&sig_manifest)?,
         )?;
         println!("Signed {index_digest} with {}", cfg.signing_key().display());
+
+        // Build provenance (SLSA v1) as a cosign-compatible DSSE attestation.
+        let provenance_path = dir.join("provenance.json");
+        if provenance_path.exists() {
+            let statement = std::fs::read(&provenance_path)?;
+            let envelope = sign::dsse_envelope(&cfg.signing_key(), &statement)?;
+            let envelope_digest = format!("sha256:{}", oci::sha256_hex(&envelope));
+            let envelope_path =
+                std::env::temp_dir().join(format!("pkgoci-att-{}", std::process::id()));
+            std::fs::write(&envelope_path, &envelope)?;
+            client.push_blob(&repo, &version, &envelope_digest, &envelope_path)?;
+            let _ = std::fs::remove_file(&envelope_path);
+
+            let att_manifest = oci::Manifest {
+                schema_version: 2,
+                media_type: Some(oci::MT_OCI_MANIFEST.into()),
+                config: oci::Descriptor {
+                    media_type: oci::MT_OCI_CONFIG.into(),
+                    digest: format!("sha256:{}", oci::sha256_hex(b"{}")),
+                    size: 2,
+                    platform: None,
+                    annotations: None,
+                },
+                layers: vec![oci::Descriptor {
+                    media_type: sign::MT_DSSE_ENVELOPE.into(),
+                    digest: envelope_digest,
+                    size: envelope.len() as u64,
+                    platform: None,
+                    // The DSSE envelope carries the signature; cosign still
+                    // requires the annotation key to be present.
+                    annotations: Some(
+                        [(sign::ANNOTATION_SIGNATURE.to_string(), String::new())].into(),
+                    ),
+                }],
+                annotations: None,
+            };
+            client.push_manifest(
+                &repo,
+                &sign::att_tag(index_digest),
+                oci::MT_OCI_MANIFEST,
+                &serde_json::to_string(&att_manifest)?,
+            )?;
+            println!("Attested build provenance for {index_digest}");
+        }
     }
 
     println!(
@@ -795,6 +1068,47 @@ pub fn verify(cfg: &Config, package: String, key: Option<std::path::PathBuf>) ->
         resolved.root_digest,
         matched.display()
     );
+
+    // Build provenance attestation (optional but reported).
+    match client.resolve(&repo, &sign::att_tag(&resolved.root_digest)) {
+        Err(_) => println!("No build provenance attestation."),
+        Ok(att) => {
+            let trusted = sign::load_trusted_keys(&trust_root)?;
+            let layer = att
+                .manifest
+                .layers
+                .first()
+                .ok_or_else(|| anyhow!("malformed attestation artifact"))?;
+            let tmp = std::env::temp_dir().join(format!("pkgoci-att-{}", std::process::id()));
+            client.download_blob(&repo, &sign::att_tag(&resolved.root_digest), layer, &tmp)?;
+            let envelope = std::fs::read(&tmp)?;
+            let _ = std::fs::remove_file(&tmp);
+            let (statement, key) = sign::verify_dsse(&trusted, &envelope)?;
+            let subject = statement
+                .pointer("/subject/0/digest/sha256")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            if format!("sha256:{subject}") != resolved.root_digest {
+                bail!(
+                    "attestation subject sha256:{subject} does not match {}",
+                    resolved.root_digest
+                );
+            }
+            println!(
+                "OK: build provenance ({}) by {} at {}, verified with {}",
+                statement["predicateType"].as_str().unwrap_or("?"),
+                statement
+                    .pointer("/predicate/runDetails/builder/id")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("?"),
+                statement
+                    .pointer("/predicate/runDetails/metadata/finishedOn")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?"),
+                key.display()
+            );
+        }
+    }
     Ok(())
 }
 

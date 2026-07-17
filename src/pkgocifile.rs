@@ -6,8 +6,14 @@
 //! DESCRIPTION My tool
 //! LICENSE MIT
 //! REQUIRES libfoo@^1.2
+//! # Prebuilt trees:
 //! PLATFORM darwin/arm64 ./out/mac-arm64
 //! PLATFORM linux/amd64 ./out/linux-amd64
+//! # Or build from source (RUN executes on the host at build time; SOURCE is
+//! # published with the package so users on other platforms can build too):
+//! SOURCE .
+//! RUN make
+//! OUTPUT ./out
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -25,6 +31,13 @@ pub struct Spec {
     pub requires: Vec<String>,
     /// (os, arch, payload directory) — paths relative to the Pkgocifile.
     pub platforms: Vec<(String, String, PathBuf)>,
+    /// Build commands executed in the Pkgocifile's directory.
+    pub run: Vec<String>,
+    /// Directory `run` produces, packed for the host platform
+    /// (and used at install time when building from source).
+    pub output: String,
+    /// Source tree published with the package for build-from-source installs.
+    pub source: Option<PathBuf>,
 }
 
 pub fn parse(path: &Path) -> Result<Spec> {
@@ -40,6 +53,9 @@ pub fn parse(path: &Path) -> Result<Spec> {
     let mut url = None;
     let mut requires = Vec::new();
     let mut platforms: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut run = Vec::new();
+    let mut output = "./out".to_string();
+    let mut source = None;
 
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -84,6 +100,15 @@ pub fn parse(path: &Path) -> Result<Spec> {
                 }
                 platforms.push((os.to_string(), arch.to_string(), dir));
             }
+            "RUN" => run.push(rest),
+            "OUTPUT" => output = rest,
+            "SOURCE" => {
+                let dir = base.join(&rest);
+                if !dir.is_dir() {
+                    return Err(err(lineno, format!("no such directory: {}", dir.display())));
+                }
+                source = Some(dir);
+            }
             other => return Err(err(lineno, format!("unknown directive {other:?}"))),
         }
     }
@@ -96,9 +121,18 @@ pub fn parse(path: &Path) -> Result<Spec> {
         url,
         requires,
         platforms,
+        run,
+        output,
+        source,
     };
-    if spec.platforms.is_empty() {
-        bail!("{}: at least one PLATFORM is required", path.display());
+    if spec.platforms.is_empty() && spec.run.is_empty() {
+        bail!(
+            "{}: at least one PLATFORM or RUN is required",
+            path.display()
+        );
+    }
+    if spec.source.is_some() && spec.run.is_empty() {
+        bail!("{}: SOURCE requires RUN build steps", path.display());
     }
     if spec.name.contains('/') || spec.name.contains('@') {
         bail!("{}: NAME must be a plain package name", path.display());

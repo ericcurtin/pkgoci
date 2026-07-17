@@ -19,11 +19,19 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 pub const MT_SIMPLE_SIGNING: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
+pub const MT_DSSE_ENVELOPE: &str = "application/vnd.dsse.envelope.v1+json";
+pub const PAYLOAD_TYPE_IN_TOTO: &str = "application/vnd.in-toto+json";
 pub const ANNOTATION_SIGNATURE: &str = "dev.cosignproject.cosign/signature";
 
 /// Tag under which the signature for `root_digest` is stored.
 pub fn sig_tag(root_digest: &str) -> String {
     format!("sha256-{}.sig", root_digest.trim_start_matches("sha256:"))
+}
+
+/// Tag under which attestations for `root_digest` are stored
+/// (cosign's convention).
+pub fn att_tag(root_digest: &str) -> String {
+    format!("sha256-{}.att", root_digest.trim_start_matches("sha256:"))
 }
 
 /// The sigstore simple-signing payload for `root_digest` of `image_ref`,
@@ -107,6 +115,55 @@ pub fn load_trusted_keys(root: &Path) -> Result<Vec<(PathBuf, VerifyingKey)>> {
 pub fn sign(key_path: &Path, payload_bytes: &[u8]) -> Result<String> {
     let key = load_signing_key(key_path)?;
     Ok(base64::engine::general_purpose::STANDARD.encode(key.sign(payload_bytes).to_bytes()))
+}
+
+/// DSSE pre-authentication encoding: what is actually signed for envelopes.
+fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = format!(
+        "DSSEv1 {} {} {} ",
+        payload_type.len(),
+        payload_type,
+        payload.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Wrap an in-toto statement in a signed DSSE envelope (cosign-compatible).
+pub fn dsse_envelope(key_path: &Path, statement: &[u8]) -> Result<Vec<u8>> {
+    let key = load_signing_key(key_path)?;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let sig = key.sign(&pae(PAYLOAD_TYPE_IN_TOTO, statement));
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "payloadType": PAYLOAD_TYPE_IN_TOTO,
+        "payload": b64.encode(statement),
+        "signatures": [{"keyid": "", "sig": b64.encode(sig.to_bytes())}]
+    }))?)
+}
+
+/// Verify a DSSE envelope against the trusted keys; returns the decoded
+/// in-toto statement and the matching key path.
+pub fn verify_dsse(
+    trusted: &[(PathBuf, VerifyingKey)],
+    envelope_bytes: &[u8],
+) -> Result<(serde_json::Value, PathBuf)> {
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let envelope: serde_json::Value = serde_json::from_slice(envelope_bytes)?;
+    let payload_type = envelope["payloadType"].as_str().unwrap_or_default();
+    let payload = b64
+        .decode(envelope["payload"].as_str().unwrap_or_default())
+        .map_err(|_| anyhow!("malformed DSSE payload"))?;
+    let message = pae(payload_type, &payload);
+    for sig_entry in envelope["signatures"].as_array().into_iter().flatten() {
+        let Some(sig_b64) = sig_entry["sig"].as_str() else {
+            continue;
+        };
+        if let Ok(key) = verify(trusted, &message, sig_b64) {
+            return Ok((serde_json::from_slice(&payload)?, key));
+        }
+    }
+    bail!("attestation verification failed (no trusted key matches)")
 }
 
 /// Verify a base64 cosign signature over `payload_bytes` against any trusted

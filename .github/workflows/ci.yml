@@ -146,6 +146,25 @@ jobs:
           if PKGOCI_VERIFY_KEY=/tmp/otherkeys/pkgoci.pub $B install hello --force; then echo "wrong-key install must fail"; exit 1; fi
           # Pushing an unbuilt package fails helpfully.
           if $B push nothere; then echo "push of unbuilt package must fail"; exit 1; fi
+          # Build-from-source: SOURCE + RUN compile at build time, the source
+          # ships with the package, and installs can rebuild it.
+          mkdir -p /tmp/src/src
+          printf '#include <stdio.h>\nint main(void){puts("compiled");return 0;}\n' > /tmp/src/src/hi.c
+          printf 'NAME srchello\nVERSION 1.0.0\nSOURCE .\nRUN mkdir -p out/bin && cc src/hi.c -o out/bin/srchello\nOUTPUT ./out\n' > /tmp/src/Pkgocifile
+          $B build /tmp/src
+          $B push srchello --sign
+          $B install srchello
+          "$RUNNER_TEMP/prefix/bin/srchello" | grep -q compiled
+          $B install srchello --force --build-from-source
+          "$RUNNER_TEMP/prefix/bin/srchello" | grep -q compiled
+          # Signature + SLSA provenance verify with pkgoci and stock cosign.
+          $B verify srchello | grep -q "build provenance"
+          DIGEST=$(cosign verify --key "$PKGOCI_VERIFY_KEY" --insecure-ignore-tlog=true \
+            --allow-insecure-registry localhost:5001/ci/srchello:1.0.0 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['critical']['image']['docker-manifest-digest'])")
+          cosign verify-attestation --key "$PKGOCI_VERIFY_KEY" --type slsaprovenance1 \
+            --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5001/ci/srchello@$DIGEST"
+          $B uninstall srchello
           # Upgrade flow.
           printf 'NAME hello\nVERSION 2.0.0\nDESCRIPTION CI test\nREQUIRES libfoo@^1\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
           $B build /tmp/hello && $B push hello@2.0.0 --sign

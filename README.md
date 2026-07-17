@@ -67,6 +67,25 @@ CLI specs accept the same constraints (`pkgoci install 'libfoo@>=1,<1.1'`),
 and `pkgoci uninstall` refuses to remove a package that another installed
 package requires (override with `--force`).
 
+### Building from source
+
+A `Pkgocifile` can build instead of (or as well as) packing prebuilt trees:
+
+```dockerfile
+NAME mytool
+VERSION 1.2.3
+SOURCE .
+RUN make
+OUTPUT ./out
+```
+
+`pkgoci build` executes the `RUN` steps on the host and packs `OUTPUT` for
+the host platform. With `SOURCE`, the source tree (and its build recipe) is
+published as part of the package, so `pkgoci install` transparently builds
+from source on platforms without prebuilt binaries — and
+`pkgoci install -s/--build-from-source` forces it. Signature verification
+happens before any build step runs.
+
 ### Signatures
 
 ```sh
@@ -79,16 +98,22 @@ pkgoci verify mytool                   # explicit check
 
 Signatures use the sigstore simple-signing payload and cosign's storage
 convention (`sha256-<digest>.sig` tag, `dev.cosignproject.cosign/signature`
-annotation), so they also verify with stock cosign:
+annotation). `pkgoci build` additionally records **SLSA v1 build provenance**
+(an in-toto statement covering the Pkgocifile, source digest, build steps,
+builder, and timestamps), which `push --sign` publishes as a DSSE attestation
+under cosign's `sha256-<digest>.att` tag. Both verify with stock cosign:
 
 ```sh
 cosign verify --key pkgoci.pub --insecure-ignore-tlog=true registry-1.docker.io/pkgoci/mytool:1.2.3
+cosign verify-attestation --key pkgoci.pub --type slsaprovenance1 \
+  --insecure-ignore-tlog=true registry-1.docker.io/pkgoci/mytool@sha256:...
 ```
 
 When `PKGOCI_VERIFY_KEY` is set (one key or a directory of trusted keys),
 every install — dependencies included — must carry a signature that verifies
 against a trusted key; missing, mismatched, and tampered signatures all abort
-the install. Verification is built in: no external tooling is needed.
+the install. `pkgoci verify` additionally checks and prints the build
+provenance. Verification is built in: no external tooling is needed.
 
 ### Publishing
 

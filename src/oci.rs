@@ -13,6 +13,14 @@ pub const ANNOTATION_DESCRIPTION: &str = "org.opencontainers.image.description";
 pub const ANNOTATION_URL: &str = "org.opencontainers.image.url";
 pub const ANNOTATION_LICENSES: &str = "org.opencontainers.image.licenses";
 pub const ANNOTATION_REQUIRES: &str = "dev.pkgoci.requires";
+/// Newline-separated build commands (from Pkgocifile RUN lines).
+pub const ANNOTATION_BUILD: &str = "dev.pkgoci.build";
+/// Directory the build commands produce, relative to the source root.
+pub const ANNOTATION_OUTPUT: &str = "dev.pkgoci.output";
+
+/// Pseudo-platform for the published source tree.
+pub const SOURCE_OS: &str = "source";
+pub const SOURCE_ARCH: &str = "all";
 
 pub type Annotations = BTreeMap<String, String>;
 

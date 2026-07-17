@@ -33,6 +33,9 @@ enum Cmd {
         /// Reinstall even if already installed
         #[arg(short, long)]
         force: bool,
+        /// Build from the published source instead of prebuilt binaries
+        #[arg(short = 's', long)]
+        build_from_source: bool,
     },
     /// Uninstall packages
     #[command(alias = "remove", alias = "rm")]
@@ -100,7 +103,11 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load();
     match cli.cmd {
-        Cmd::Install { packages, force } => commands::install(&cfg, packages, force),
+        Cmd::Install {
+            packages,
+            force,
+            build_from_source,
+        } => commands::install(&cfg, packages, force, build_from_source),
         Cmd::Uninstall { packages, force } => commands::uninstall(&cfg, packages, force),
         Cmd::List => commands::list(&cfg),
         Cmd::Info { package } => commands::info(&cfg, package),

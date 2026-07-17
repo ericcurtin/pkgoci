@@ -68,6 +68,9 @@ pub struct Resolved {
     /// this is what signatures are made over.
     pub root_digest: String,
     pub index: Option<Index>,
+    /// True when the selected manifest is the published source tree
+    /// (no prebuilt binaries for the host platform).
+    pub from_source: bool,
 }
 
 impl Resolved {
@@ -118,12 +121,37 @@ impl Client {
     /// Resolve a tag to the manifest for the host platform (descending
     /// through an image index if present).
     pub fn resolve(&self, repo: &str, tag: &str) -> Result<Resolved> {
+        match self.resolve_platform(repo, tag, crate::platform::os(), crate::platform::arch()) {
+            // No binaries for the host platform: fall back to the published
+            // source tree if there is one.
+            Err(e) if e.to_string().contains("has no build for") => self
+                .resolve_platform(repo, tag, crate::oci::SOURCE_OS, crate::oci::SOURCE_ARCH)
+                .map(|mut r| {
+                    r.from_source = true;
+                    r
+                })
+                .map_err(|_| e),
+            other => other,
+        }
+    }
+
+    /// Resolve the published source tree explicitly (--build-from-source).
+    pub fn resolve_source(&self, repo: &str, tag: &str) -> Result<Resolved> {
+        let mut resolved =
+            self.resolve_platform(repo, tag, crate::oci::SOURCE_OS, crate::oci::SOURCE_ARCH)?;
+        resolved.from_source = true;
+        Ok(resolved)
+    }
+
+    pub fn resolve_platform(
+        &self,
+        repo: &str,
+        tag: &str,
+        os: &str,
+        arch: &str,
+    ) -> Result<Resolved> {
         let reference = self.reference(repo, tag);
-        let (r, o, a) = (
-            cstring(&reference)?,
-            cstring(crate::platform::os())?,
-            cstring(crate::platform::arch())?,
-        );
+        let (r, o, a) = (cstring(&reference)?, cstring(os)?, cstring(arch)?);
         let v = take_result(unsafe { PkgociResolve(r.as_ptr(), o.as_ptr(), a.as_ptr()) }).map_err(
             |e| {
                 if e.to_string().contains("not found") {
@@ -151,6 +179,7 @@ impl Client {
             manifest_digest,
             root_digest,
             index,
+            from_source: false,
         })
     }
 
