@@ -19,7 +19,7 @@ jobs:
           cache-dependency-path: go/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: gofmt -l go | tee /dev/stderr | wc -l | grep -q '^0$'
+      - run: gofmt -l go | tee /dev/stderr | wc -l | grep '^0$'
       - run: cargo clippy --release -- -D warnings
 
   build:
@@ -137,20 +137,20 @@ jobs:
           # newest libfoo satisfying ^1 (1.4.2), not 2.0.0.
           export PKGOCI_VERIFY_KEY="$RUNNER_TEMP/prefix/keys/pkgoci.pub"
           $B install hello
-          "$RUNNER_TEMP/prefix/bin/hello" | grep -q "hello from pkgoci"
-          $B info hello | grep -q "Requires: libfoo@^1"
-          $B list | grep -q "libfoo 1.4.2"
+          "$RUNNER_TEMP/prefix/bin/hello" | grep "hello from pkgoci"
+          $B info hello | grep "Requires: libfoo@^1"
+          $B list | grep "libfoo 1.4.2"
           $B verify libfoo
           # Conflicting constraints fail with a PubGrub explanation.
           printf 'NAME app\nVERSION 1.0.0\nREQUIRES libfoo@^2\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
           $B build /tmp/hello && $B push app --sign
           if out=$($B install hello app --force 2>&1); then echo "conflict install must fail"; exit 1; fi
-          echo "$out" | grep -q "version solving failed"
+          echo "$out" | grep "version solving failed"
           # Signatures verify with stock cosign.
           cosign verify --key "$PKGOCI_VERIFY_KEY" --insecure-ignore-tlog=true \
             --allow-insecure-registry localhost:5001/ci/libfoo:1.4.2
           # Dependency protection.
-          $B uninstall libfoo 2>&1 | grep -q "required by hello"
+          $B uninstall libfoo 2>&1 | grep "required by hello"
           # Unsigned and wrongly-signed packages are rejected.
           printf 'NAME unsigned\nVERSION 1.0.0\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
           $B build /tmp/hello && $B push unsigned
@@ -167,20 +167,20 @@ jobs:
           $B build /tmp/src
           $B push srchello --sign
           $B install srchello
-          "$RUNNER_TEMP/prefix/bin/srchello" | grep -q compiled
+          "$RUNNER_TEMP/prefix/bin/srchello" | grep compiled
           $B install srchello --force --build-from-source
-          "$RUNNER_TEMP/prefix/bin/srchello" | grep -q compiled
+          "$RUNNER_TEMP/prefix/bin/srchello" | grep compiled
           # Source builds run inside the docker sandbox: no network, and
           # writes confined to the mounted work tree.
-          $B build /tmp/src 2>&1 | grep -q "Sandbox: docker"
+          $B build /tmp/src 2>&1 | grep "Sandbox: docker"
           mkdir -p /tmp/evil
           printf 'NAME evil\nVERSION 1.0.0\nRUN mkdir -p out && curl -fsS --max-time 5 https://example.com -o out/x\nOUTPUT ./out\n' > /tmp/evil/Pkgocifile
           if $B build /tmp/evil; then echo "network in sandbox must fail"; exit 1; fi
           # Transparency log: record in public Rekor and verify the receipt.
           $B push srchello --sign --rekor
-          $B verify srchello | grep -q "transparency log entry"
+          $B verify srchello | grep "transparency log entry"
           # Signature + SLSA provenance verify with pkgoci and stock cosign.
-          $B verify srchello | grep -q "build provenance"
+          $B verify srchello | grep "build provenance"
           DIGEST=$(cosign verify --key "$PKGOCI_VERIFY_KEY" --insecure-ignore-tlog=true \
             --allow-insecure-registry localhost:5001/ci/srchello:1.0.0 2>/dev/null \
             | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['critical']['image']['docker-manifest-digest'])")
@@ -191,7 +191,7 @@ jobs:
           printf 'NAME hello\nVERSION 2.0.0\nDESCRIPTION CI test\nREQUIRES libfoo@^1\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
           $B build /tmp/hello && $B push hello@2.0.0 --sign
           $B upgrade
-          $B list | grep -q "hello 2.0.0"
+          $B list | grep "hello 2.0.0"
           $B cleanup
           $B uninstall hello
           $B uninstall libfoo
@@ -217,7 +217,7 @@ jobs:
           "$RUNNER_TEMP/prefix/bin/lua" -v
           "$RUNNER_TEMP/prefix/bin/ninja" --version
           "$RUNNER_TEMP/prefix/bin/zstd" --version
-          $B verify jq | grep -q "build provenance"
+          $B verify jq | grep "build provenance"
           # Rebuild one from its published source layer (RUN:linux path).
           $B install lua --force --build-from-source
           "$RUNNER_TEMP/prefix/bin/lua" -v
