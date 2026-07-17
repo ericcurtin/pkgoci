@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --release -- -D warnings
+
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin/arm64
+            artifact: darwin-arm64
+            runner: macos-14
+          - platform: linux/amd64
+            artifact: linux-amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            artifact: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: windows/amd64
+            artifact: windows-amd64
+            runner: windows-latest
+          - platform: windows/arm64
+            artifact: windows-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: cargo test --release
+      - name: Smoke test
+        shell: bash
+        run: |
+          ./target/release/pkgoci --version
+          ./target/release/pkgoci prefix
+          ./target/release/pkgoci list
+          ./target/release/pkgoci update
+      - name: End-to-end roundtrip (local registry)
+        if: startsWith(matrix.platform, 'linux')
+        shell: bash
+        run: |
+          docker run -d --rm --name reg -p 5001:5000 registry:2
+          sleep 3
+          export PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=ci PKGOCI_PREFIX="$RUNNER_TEMP/prefix"
+          B=./target/release/pkgoci
+          mkdir -p /tmp/hello/bin
+          printf '#!/bin/sh\necho "hello from pkgoci"\n' > /tmp/hello/bin/hello
+          chmod +x /tmp/hello/bin/hello
+          PLATFORM="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+          $B push hello --version 1.0.0 --description "CI test" --dir "$PLATFORM=/tmp/hello"
+          $B install hello
+          "$RUNNER_TEMP/prefix/bin/hello" | grep -q "hello from pkgoci"
+          $B info hello
+          $B list | grep -q "hello 1.0.0"
+          $B push hello --version 2.0.0 --dir "$PLATFORM=/tmp/hello"
+          $B upgrade
+          $B list | grep -q "hello 2.0.0"
+          $B cleanup
+          $B uninstall hello
+          test ! -e "$RUNNER_TEMP/prefix/bin/hello"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkgoci-${{ matrix.artifact }}
+          path: |
+            target/release/pkgoci
+            target/release/pkgoci.exe
+          if-no-files-found: error
