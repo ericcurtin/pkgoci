@@ -7,17 +7,19 @@ experiment with a big premise: **what if a package manager didn't need any
 package infrastructure at all?**
 
 No formula repository. No package index to sync. No custom CDN, no custom
-metadata service, no custom protocol. Just OCI registries — the same
-infrastructure that already serves billions of container image pulls a day —
-holding ordinary, spec-compliant artifacts that any OCI tool can inspect.
+metadata service, no custom protocol — not even for dependencies or
+signatures. Just OCI registries — the same infrastructure that already serves
+billions of container image pulls a day — holding ordinary, spec-compliant
+artifacts that any OCI tool can inspect.
 
 ```sh
 pkgoci install hello
 ```
 
-That one command does a manifest resolve and a digest-verified blob download
-from Docker Hub, extracts the payload into a Homebrew-style Cellar, and links
-the binaries into your `PATH`. That's the whole trick.
+That one command resolves a manifest, verifies a signature, pulls the
+package's dependencies, downloads digest-verified blobs from Docker Hub,
+extracts everything into a Homebrew-style Cellar, and links the binaries into
+your `PATH`. That's the whole trick.
 
 ## Homebrew got there first (almost)
 
@@ -67,7 +69,48 @@ and the result is still a single self-contained executable.
 
 The Rust side keeps everything that makes it a package manager rather than a
 container tool: the CLI, the Cellar layout and receipts, linking/shims,
-tar+gzip/zstd extraction, upgrades, cleanup.
+tar+gzip/zstd extraction, dependency resolution, signing, upgrades, cleanup.
+
+## Dependencies, without a solver service
+
+A package can declare what it needs at runtime — one more standard
+annotation on the artifact, `dev.pkgoci.requires`:
+
+```sh
+pkgoci push mytool --version 1.2.3 --requires libfoo --dir ...
+```
+
+At install time pkgoci expands the dependency graph breadth-first straight
+from the registry, deduplicates it, and — because dependencies are
+runtime-only, not install-time — fetches and installs the entire plan **in
+parallel**. Receipts remember the edges, so `pkgoci uninstall libfoo` refuses
+to strand a package that still needs it (override with `--force`), and
+`pkgoci info` shows the `Requires:` list.
+
+No lockfile server, no dependency database: the graph lives on the artifacts
+themselves.
+
+## Signatures, stored where the packages are
+
+Signing follows the same rule — no new infrastructure. pkgoci uses plain
+ed25519 keypairs and stores each signature *in the registry, next to the
+package*, as another OCI artifact under the cosign-style triangle tag
+`sha256-<digest>.sig`:
+
+```sh
+pkgoci keygen                       # keypair in <prefix>/keys
+pkgoci push mytool ... --sign       # signs the package index digest
+
+# consumers opt in, then verification is enforced:
+export PKGOCI_VERIFY_KEY=/path/to/pkgoci.pub
+pkgoci install mytool
+```
+
+With `PKGOCI_VERIFY_KEY` set, installs **fail closed**: a missing signature,
+a signature made with a different key, or a tampered artifact all abort the
+install — and that applies to every dependency in the plan, not just the
+package you asked for. The digest chain does the rest: the signature covers
+the index, the index pins the manifests, the manifests pin the blobs.
 
 ## It's fast — measurably faster than Homebrew on everything
 
@@ -80,7 +123,8 @@ Two design decisions do most of the work here:
    registry, so `pkgoci update` has literally nothing to do, and there's no
    multi-second `brew update` tax to pay.
 
-`hyperfine` numbers from an M-series MacBook (Homebrew 6.0.6, `bench/bench.sh`
+`hyperfine` numbers from an M-series MacBook (Homebrew 6.0.6,
+[`bench/bench.sh`](https://github.com/ericcurtin/pkgoci/blob/main/bench/bench.sh)
 in the repo):
 
 | Benchmark             | pkgoci   | brew     | Speedup |
@@ -99,11 +143,13 @@ magnitude faster.
 ## Publishing is a first-class verb
 
 There's no formula to write and no PR to send. If you can build your tool for
-a platform, you can publish it with one command:
+a platform, you can publish it — dependencies, signature, and all — with one
+command:
 
 ```sh
 pkgoci push mytool --version 1.2.3 --license MIT \
   --description "My tool" \
+  --requires libfoo --sign \
   --dir darwin/arm64=./out/mac-arm64 \
   --dir linux/amd64=./out/linux-amd64 \
   --dir linux/arm64=./out/linux-arm64 \
@@ -112,9 +158,9 @@ pkgoci push mytool --version 1.2.3 --license MIT \
 ```
 
 Each directory becomes a `tar+gzip` layer, each platform a manifest, the set
-an image index tagged `1.2.3` and `latest` — pushed through containerd's
-pusher to any registry you have credentials for. Your users then
-`PKGOCI_NAMESPACE=yourname pkgoci install mytool`.
+an image index tagged `1.2.3` and `latest`, plus a signature artifact —
+pushed through containerd's pusher to any registry you have credentials for.
+Your users then `PKGOCI_NAMESPACE=yourname pkgoci install mytool`.
 
 Distribution, hosting, bandwidth, auth, mirrors: all outsourced to registry
 operators who already solved those problems for containers.
@@ -126,17 +172,15 @@ This is a young project, and I'd rather list its gaps than oversell it:
 - **There's no package catalog yet.** The design removes the need for
   *infrastructure*, not for *packages*. The default `pkgoci` namespace on
   Docker Hub needs to be populated before `pkgoci install jq` means anything.
-- **No dependency resolution.** Today a package is a self-contained tree.
-  That's fine for static binaries (a large and growing share of modern CLI
-  tools) and wrong for C libraries with deep dependency graphs. Homebrew's
-  formula DSL, build-from-source support, casks, services, and taps represent
-  two decades of ecosystem pkgoci does not replace.
-- **No signatures yet.** Downloads are digest-verified end to end, but there
-  is no sigstore/cosign-style signing story yet — although storing packages
-  as OCI artifacts means those tools slot in naturally.
-- **The embedded Go runtime costs something**: the binary is ~11 MB instead
-  of ~2.5 MB, and startup is ~11 ms instead of ~4 ms. That trade bought us
-  containerd's battle-tested registry code instead of a hand-rolled client.
+- **Dependency resolution is deliberately simple.** Requirements are package
+  names (optionally pinned versions) — there is no version-constraint solver
+  and no conflict resolution. That's the right shape for distributing tools
+  and their runtime libraries; it does not replace Homebrew's formula DSL,
+  build-from-source support, casks, services, or two decades of ecosystem.
+- **Signing is keypair-based.** There's no sigstore-style keyless flow or
+  transparency log yet; key distribution is up to you. Because signatures are
+  ordinary OCI artifacts in cosign's tag convention, that upgrade path slots
+  in naturally later.
 
 ## Try it
 
@@ -148,13 +192,14 @@ cargo build --release   # needs Rust + Go toolchains
 docker run -d --rm -p 5001:5000 registry:2
 export PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=test PKGOCI_PREFIX=/tmp/pkgoci
 mkdir -p /tmp/hello/bin && printf '#!/bin/sh\necho hi\n' > /tmp/hello/bin/hi && chmod +x /tmp/hello/bin/hi
-./target/release/pkgoci push hello --version 1.0.0 --dir darwin/arm64=/tmp/hello  # or linux/amd64, ...
-./target/release/pkgoci install hello
+./target/release/pkgoci keygen
+./target/release/pkgoci push hello --version 1.0.0 --sign --dir darwin/arm64=/tmp/hello  # or linux/amd64, ...
+PKGOCI_VERIFY_KEY=/tmp/pkgoci/keys/pkgoci.pub ./target/release/pkgoci install hello
 /tmp/pkgoci/bin/hi
 ```
 
 The code is Apache-2.0 on
-[GitHub](https://github.com/ericcurtin/pkgoci). Issues, benchmarks
+[GitHub](https://github.com/ericcurtin/pkgoci). Issues, benchmark
 reproductions, and packages for the ecosystem are all very welcome.
 
 *Registries all the way down.*

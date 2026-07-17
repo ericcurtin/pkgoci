@@ -5,6 +5,7 @@ mod extract;
 mod oci;
 mod platform;
 mod registry;
+mod sign;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -33,7 +34,12 @@ enum Cmd {
     },
     /// Uninstall packages
     #[command(alias = "remove", alias = "rm")]
-    Uninstall { packages: Vec<String> },
+    Uninstall {
+        packages: Vec<String>,
+        /// Remove even if other installed packages require it
+        #[arg(short, long)]
+        force: bool,
+    },
     /// List installed packages
     #[command(alias = "ls")]
     List,
@@ -62,6 +68,18 @@ enum Cmd {
         description: Option<String>,
         #[arg(long)]
         license: Option<String>,
+        /// Runtime dependency (repeatable), e.g. --requires libfoo
+        #[arg(long = "requires")]
+        requires: Vec<String>,
+        /// Sign the package with the key from `pkgoci keygen`
+        #[arg(long)]
+        sign: bool,
+    },
+    /// Generate an ed25519 signing keypair
+    Keygen {
+        /// Output directory (default: <prefix>/keys)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -77,7 +95,7 @@ fn run() -> Result<()> {
     let cfg = Config::load();
     match cli.cmd {
         Cmd::Install { packages, force } => commands::install(&cfg, packages, force),
-        Cmd::Uninstall { packages } => commands::uninstall(&cfg, packages),
+        Cmd::Uninstall { packages, force } => commands::uninstall(&cfg, packages, force),
         Cmd::List => commands::list(&cfg),
         Cmd::Info { package } => commands::info(&cfg, package),
         Cmd::Search { term } => commands::search(&cfg, term),
@@ -94,6 +112,18 @@ fn run() -> Result<()> {
             dirs,
             description,
             license,
-        } => commands::push(&cfg, name, version, dirs, description, license),
+            requires,
+            sign,
+        } => commands::push(
+            &cfg,
+            name,
+            version,
+            dirs,
+            description,
+            license,
+            requires,
+            sign,
+        ),
+        Cmd::Keygen { out } => commands::keygen(&cfg, out),
     }
 }

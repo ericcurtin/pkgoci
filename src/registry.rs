@@ -62,6 +62,9 @@ pub struct Client {
 pub struct Resolved {
     pub manifest: Manifest,
     pub manifest_digest: String,
+    /// Digest of the artifact the tag points at (index when present);
+    /// this is what signatures are made over.
+    pub root_digest: String,
     pub index: Option<Index>,
 }
 
@@ -137,9 +140,14 @@ impl Client {
             .as_str()
             .ok_or_else(|| anyhow!("no digest in resolve result"))?
             .to_string();
+        let root_digest = v["rootDigest"]
+            .as_str()
+            .unwrap_or(&manifest_digest)
+            .to_string();
         Ok(Resolved {
             manifest,
             manifest_digest,
+            root_digest,
             index,
         })
     }

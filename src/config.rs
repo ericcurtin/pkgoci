@@ -39,6 +39,18 @@ impl Config {
         self.prefix.join("cache")
     }
 
+    /// Private key used by `push --sign`.
+    pub fn signing_key(&self) -> PathBuf {
+        std::env::var_os("PKGOCI_SIGNING_KEY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.prefix.join("keys").join("pkgoci.key"))
+    }
+
+    /// Public key installs must verify against, if configured.
+    pub fn verify_key(&self) -> Option<PathBuf> {
+        std::env::var_os("PKGOCI_VERIFY_KEY").map(PathBuf::from)
+    }
+
     pub fn is_docker_hub(&self) -> bool {
         self.registry.ends_with("docker.io")
     }

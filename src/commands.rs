@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -6,7 +7,8 @@ use crate::cellar::{self, Receipt};
 use crate::config::Config;
 use crate::extract;
 use crate::oci;
-use crate::registry::Client;
+use crate::registry::{Client, Resolved};
+use crate::sign;
 
 /// Split `name@version` into (name, tag).
 fn parse_spec(spec: &str) -> (String, String) {
@@ -18,6 +20,26 @@ fn parse_spec(spec: &str) -> (String, String) {
     }
 }
 
+/// Short package name (basename) of a spec.
+fn short_name(spec: &str) -> String {
+    let (name, _) = parse_spec(spec);
+    name.rsplit('/').next().unwrap_or(&name).to_string()
+}
+
+/// Dependencies declared on a resolved artifact.
+fn requires(resolved: &Resolved) -> Vec<String> {
+    resolved
+        .annotation(oci::ANNOTATION_REQUIRES)
+        .map(|r| {
+            r.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------- install
 
 pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
@@ -27,12 +49,32 @@ pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
     let start = Instant::now();
     let client = Client::new(&cfg.registry);
 
+    // Expand the dependency graph breadth-first, deduplicating by package
+    // name. Dependencies are runtime-only, so install order doesn't matter
+    // and the whole plan can proceed in parallel.
+    let mut queue: VecDeque<String> = packages.into();
+    let mut seen = HashSet::new();
+    let mut plan: Vec<(String, Resolved)> = Vec::new();
+    while let Some(spec) = queue.pop_front() {
+        if !seen.insert(short_name(&spec)) {
+            continue;
+        }
+        let (name, tag) = parse_spec(&spec);
+        let resolved = client
+            .resolve(&cfg.repo_for(&name), &tag)
+            .map_err(|e| anyhow!("{spec}: {e:#}"))?;
+        queue.extend(requires(&resolved));
+        plan.push((spec, resolved));
+    }
+
     let failures = std::thread::scope(|s| {
-        let handles: Vec<_> = packages
+        let handles: Vec<_> = plan
             .iter()
-            .map(|spec| {
-                let (client, spec) = (&client, spec.clone());
-                s.spawn(move || install_one(cfg, client, &spec, force).map_err(|e| (spec, e)))
+            .map(|(spec, resolved)| {
+                let client = &client;
+                s.spawn(move || {
+                    install_one(cfg, client, spec, resolved, force).map_err(|e| (spec.clone(), e))
+                })
             })
             .collect();
         handles
@@ -48,18 +90,52 @@ pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn install_one(cfg: &Config, client: &Client, spec: &str, force: bool) -> Result<()> {
+/// Fetch and verify the signature artifact for `resolved`, if a verify key
+/// is configured. Fails closed: a configured key plus a missing or invalid
+/// signature aborts the install.
+fn verify_signature(cfg: &Config, client: &Client, repo: &str, resolved: &Resolved) -> Result<()> {
+    let Some(pub_path) = cfg.verify_key() else {
+        return Ok(());
+    };
+    let tag = sign::sig_tag(&resolved.root_digest);
+    let sig = client
+        .resolve(repo, &tag)
+        .map_err(|_| anyhow!("no signature found for {repo} ({})", resolved.root_digest))?;
+    let layer = sig
+        .manifest
+        .layers
+        .first()
+        .ok_or_else(|| anyhow!("malformed signature artifact for {repo}"))?;
+    let tmp = std::env::temp_dir().join(format!(
+        "pkgoci-sig-{}-{}",
+        std::process::id(),
+        &layer.digest.trim_start_matches("sha256:")[..12]
+    ));
+    client.download_blob(repo, &tag, layer, &tmp)?;
+    let payload: sign::SignaturePayload = serde_json::from_slice(&std::fs::read(&tmp)?)?;
+    let _ = std::fs::remove_file(&tmp);
+    sign::verify(&pub_path, &resolved.root_digest, &payload)
+}
+
+fn install_one(
+    cfg: &Config,
+    client: &Client,
+    spec: &str,
+    resolved: &Resolved,
+    force: bool,
+) -> Result<()> {
     let (name, tag) = parse_spec(spec);
     let repo = cfg.repo_for(&name);
-    let short = name.rsplit('/').next().unwrap_or(&name).to_string();
+    let short = short_name(spec);
 
-    let resolved = client.resolve(&repo, &tag)?;
     let version = resolved.version(&tag);
 
     if !force && cellar::read_receipt(cfg, &short, &version).is_some() {
         println!("{short} {version} is already installed");
         return Ok(());
     }
+
+    verify_signature(cfg, client, &repo, resolved)?;
 
     let layer = resolved
         .manifest
@@ -120,6 +196,7 @@ fn install_one(cfg: &Config, client: &Client, spec: &str, force: bool) -> Result
             manifest_digest: resolved.manifest_digest.clone(),
             installed_at: cellar::now_unix(),
             linked: linked.clone(),
+            dependencies: requires(resolved).iter().map(|d| short_name(d)).collect(),
         },
     )?;
 
@@ -133,17 +210,38 @@ fn install_one(cfg: &Config, client: &Client, spec: &str, force: bool) -> Result
 
 // -------------------------------------------------------------- uninstall
 
-pub fn uninstall(cfg: &Config, packages: Vec<String>) -> Result<()> {
+pub fn uninstall(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
     if packages.is_empty() {
         bail!("no packages given");
     }
+    let removing: HashSet<String> = packages.iter().map(|s| short_name(s)).collect();
     for spec in packages {
-        let (name, _) = parse_spec(&spec);
-        let short = name.rsplit('/').next().unwrap_or(&name).to_string();
+        let short = short_name(&spec);
         let versions = cellar::installed_versions(cfg, &short);
         if versions.is_empty() {
             eprintln!("error: {short} is not installed");
             continue;
+        }
+        if !force {
+            // Refuse to remove something another installed package requires.
+            let dependents: Vec<String> = cellar::list_installed(cfg)
+                .into_iter()
+                .filter(|(name, _)| *name != short && !removing.contains(name))
+                .filter(|(name, versions)| {
+                    versions
+                        .last()
+                        .and_then(|v| cellar::read_receipt(cfg, name, v))
+                        .is_some_and(|r| r.dependencies.contains(&short))
+                })
+                .map(|(name, _)| name)
+                .collect();
+            if !dependents.is_empty() {
+                eprintln!(
+                    "error: {short} is required by {} (use --force to remove anyway)",
+                    dependents.join(", ")
+                );
+                continue;
+            }
         }
         for version in versions {
             if let Some(receipt) = cellar::read_receipt(cfg, &short, &version) {
@@ -184,6 +282,10 @@ pub fn info(cfg: &Config, package: String) -> Result<()> {
     }
     if let Some(license) = resolved.annotation(oci::ANNOTATION_LICENSES) {
         println!("License: {license}");
+    }
+    let deps = requires(&resolved);
+    if !deps.is_empty() {
+        println!("Requires: {}", deps.join(", "));
     }
     println!("Source: {}/{repo}:{tag}", cfg.registry);
     if let Some(index) = &resolved.index {
@@ -362,6 +464,7 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
 
 /// Publish a directory as a (multi-platform) package.
 /// `platform_dirs` entries look like `darwin/arm64=./out/mac-arm64`.
+#[allow(clippy::too_many_arguments)]
 pub fn push(
     cfg: &Config,
     name: String,
@@ -369,6 +472,8 @@ pub fn push(
     platform_dirs: Vec<String>,
     description: Option<String>,
     license: Option<String>,
+    requires: Vec<String>,
+    sign_it: bool,
 ) -> Result<()> {
     if platform_dirs.is_empty() {
         bail!("at least one --dir os/arch=path is required");
@@ -384,6 +489,9 @@ pub fn push(
     }
     if let Some(l) = &license {
         annotations.insert(oci::ANNOTATION_LICENSES.into(), l.clone());
+    }
+    if !requires.is_empty() {
+        annotations.insert(oci::ANNOTATION_REQUIRES.into(), requires.join(","));
     }
 
     // Shared empty config blob.
@@ -460,14 +568,68 @@ pub fn push(
         annotations: Some(annotations),
     };
     let index_json = serde_json::to_string(&index)?;
+    let index_digest = format!("sha256:{}", oci::sha256_hex(index_json.as_bytes()));
     for tag in [version.as_str(), "latest"] {
         client.push_manifest(&repo, tag, oci::MT_OCI_INDEX, &index_json)?;
     }
+
+    if sign_it {
+        let payload = sign::sign(&cfg.signing_key(), &index_digest)?;
+        let payload_json = serde_json::to_string(&payload)?;
+        let payload_digest = format!("sha256:{}", oci::sha256_hex(payload_json.as_bytes()));
+        let payload_path = tmp.join("sig.json");
+        std::fs::write(&payload_path, &payload_json)?;
+        client.push_blob(&repo, &version, &payload_digest, &payload_path)?;
+
+        let sig_manifest = oci::Manifest {
+            schema_version: 2,
+            media_type: Some(oci::MT_OCI_MANIFEST.into()),
+            config: oci::Descriptor {
+                media_type: oci::MT_OCI_CONFIG.into(),
+                digest: config_digest.clone(),
+                size: config_bytes.len() as u64,
+                platform: None,
+                annotations: None,
+            },
+            layers: vec![oci::Descriptor {
+                media_type: oci::MT_PKGOCI_SIG.into(),
+                digest: payload_digest,
+                size: payload_json.len() as u64,
+                platform: None,
+                annotations: None,
+            }],
+            annotations: None,
+        };
+        client.push_manifest(
+            &repo,
+            &sign::sig_tag(&index_digest),
+            oci::MT_OCI_MANIFEST,
+            &serde_json::to_string(&sig_manifest)?,
+        )?;
+        println!("Signed {index_digest} with {}", cfg.signing_key().display());
+    }
+
     let _ = std::fs::remove_dir_all(&tmp);
     println!(
         "Pushed {}/{repo}:{version} ({} platform(s))",
         cfg.registry,
         index.manifests.len()
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------- keygen
+
+pub fn keygen(cfg: &Config, out: Option<std::path::PathBuf>) -> Result<()> {
+    let dir = out.unwrap_or_else(|| cfg.prefix.join("keys"));
+    let (key, public) = sign::generate(&dir)?;
+    println!(
+        "Private key: {} (keep secret; used by `pkgoci push --sign`)",
+        key.display()
+    );
+    println!(
+        "Public key:  {} (distribute; set PKGOCI_VERIFY_KEY to enforce)",
+        public.display()
     );
     Ok(())
 }

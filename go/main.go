@@ -79,9 +79,12 @@ func fetchAll(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.Descrip
 }
 
 type resolveResult struct {
-	Digest   string          `json:"digest"`
-	Manifest json.RawMessage `json:"manifest"`
-	Index    json.RawMessage `json:"index,omitempty"`
+	// Digest of the platform manifest actually selected.
+	Digest string `json:"digest"`
+	// Digest of the artifact the tag points at (the index when present).
+	RootDigest string          `json:"rootDigest"`
+	Manifest   json.RawMessage `json:"manifest"`
+	Index      json.RawMessage `json:"index,omitempty"`
 }
 
 // PkgociResolve resolves a reference and, if it is an index, descends into
@@ -106,7 +109,7 @@ func PkgociResolve(cRef, cOS, cArch *C.char) *C.char {
 		return jsonResult(nil, err)
 	}
 
-	res := resolveResult{Digest: desc.Digest.String(), Manifest: body}
+	res := resolveResult{Digest: desc.Digest.String(), RootDigest: desc.Digest.String(), Manifest: body}
 	if desc.MediaType == ocispec.MediaTypeImageIndex || desc.MediaType == mediaTypeDockerManifestList {
 		var index ocispec.Index
 		if err := json.Unmarshal(body, &index); err != nil {
@@ -134,7 +137,7 @@ func PkgociResolve(cRef, cOS, cArch *C.char) *C.char {
 		if err != nil {
 			return jsonResult(nil, err)
 		}
-		res = resolveResult{Digest: chosen.Digest.String(), Manifest: mbody, Index: body}
+		res = resolveResult{Digest: chosen.Digest.String(), RootDigest: desc.Digest.String(), Manifest: mbody, Index: body}
 	}
 	return jsonResult(res, nil)
 }

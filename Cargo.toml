@@ -18,6 +18,8 @@ ruzstd = "0.8"
 tar = "0.4"
 dirs = "5"
 ureq = { version = "2", features = ["json"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 
 [profile.release]
 lto = "thin"

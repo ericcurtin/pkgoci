@@ -4,7 +4,7 @@ A fast, native package manager backed by OCI registries — like Homebrew, but
 packages live on **Docker Hub** by default (any OCI registry works).
 
 > New here? Read the introduction:
-> [Introducing pkgoci: a package manager where every package is an OCI artifact](blog/2026-07-17-introducing-pkgoci.md)
+> [Introducing pkgoci: a package manager where every package is an OCI artifact](https://ericcurtin.github.io/pkgoci/blog/2026-07-17-introducing-pkgoci.html)
 
 The CLI is written in Rust; all registry protocol handling is
 **containerd's distribution stack** (`core/remotes/docker` — resolver,
@@ -48,11 +48,35 @@ pkgoci prefix
 
 Add `$(pkgoci prefix)/bin` to your `PATH`.
 
+### Dependencies
+
+Packages can declare runtime dependencies (a `dev.pkgoci.requires`
+annotation). `pkgoci install` expands the graph, deduplicates it, and installs
+everything in parallel; `pkgoci uninstall` refuses to remove a package that
+another installed package requires (override with `--force`).
+
+### Signatures
+
+```sh
+pkgoci keygen                          # ed25519 keypair in <prefix>/keys
+pkgoci push mytool ... --sign          # signs the package index
+export PKGOCI_VERIFY_KEY=/path/pkgoci.pub
+pkgoci install mytool                  # now fails closed without a valid signature
+```
+
+Signatures are made over the tag's index digest and stored in the registry as
+an OCI artifact under the cosign-style tag `sha256-<digest>.sig`. When
+`PKGOCI_VERIFY_KEY` is set, every install (dependencies included) must carry a
+signature that verifies against that key.
+
+### Publishing
+
 Publishing (needs `PKGOCI_USERNAME`/`PKGOCI_PASSWORD`):
 
 ```sh
 pkgoci push mytool --version 1.2.3 --license MIT \
   --description "My tool" \
+  --requires libfoo --sign \
   --dir darwin/arm64=./out/mac-arm64 \
   --dir linux/amd64=./out/linux-amd64 \
   --dir linux/arm64=./out/linux-arm64 \
@@ -62,11 +86,13 @@ pkgoci push mytool --version 1.2.3 --license MIT \
 
 ### Configuration
 
-| Variable            | Default                 |
-|---------------------|-------------------------|
-| `PKGOCI_PREFIX`     | `~/.pkgoci` (`%LOCALAPPDATA%\pkgoci` on Windows) |
-| `PKGOCI_REGISTRY`   | `registry-1.docker.io`  |
-| `PKGOCI_NAMESPACE`  | `pkgoci`                |
+| Variable             | Default                 |
+|----------------------|-------------------------|
+| `PKGOCI_PREFIX`      | `~/.pkgoci` (`%LOCALAPPDATA%\pkgoci` on Windows) |
+| `PKGOCI_REGISTRY`    | `registry-1.docker.io`  |
+| `PKGOCI_NAMESPACE`   | `pkgoci`                |
+| `PKGOCI_SIGNING_KEY` | `<prefix>/keys/pkgoci.key` |
+| `PKGOCI_VERIFY_KEY`  | unset (no verification) |
 
 Names may include a namespace (`pkgoci install someorg/sometool`), and
 `localhost`/`127.*` registries are reached over plain HTTP (containerd's

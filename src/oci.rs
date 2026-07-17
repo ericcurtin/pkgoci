@@ -8,10 +8,13 @@ pub const MT_OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 pub const MT_LAYER_TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 pub const MT_LAYER_TAR_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 
+pub const MT_PKGOCI_SIG: &str = "application/vnd.pkgoci.signature.v1+json";
+
 pub const ANNOTATION_VERSION: &str = "org.opencontainers.image.version";
 pub const ANNOTATION_DESCRIPTION: &str = "org.opencontainers.image.description";
 pub const ANNOTATION_URL: &str = "org.opencontainers.image.url";
 pub const ANNOTATION_LICENSES: &str = "org.opencontainers.image.licenses";
+pub const ANNOTATION_REQUIRES: &str = "dev.pkgoci.requires";
 
 pub type Annotations = BTreeMap<String, String>;
 

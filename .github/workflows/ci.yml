@@ -105,16 +105,30 @@ jobs:
           printf '#!/bin/sh\necho "hello from pkgoci"\n' > /tmp/hello/bin/hello
           chmod +x /tmp/hello/bin/hello
           PLATFORM="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
-          $B push hello --version 1.0.0 --description "CI test" --dir "$PLATFORM=/tmp/hello"
+          mkdir -p /tmp/libfoo/lib && echo fake > /tmp/libfoo/lib/libfoo.so
+          $B keygen
+          $B push libfoo --version 1.0.0 --sign --dir "$PLATFORM=/tmp/libfoo"
+          $B push hello --version 1.0.0 --description "CI test" --sign --requires libfoo --dir "$PLATFORM=/tmp/hello"
+          # Install with signature verification; dependency comes along.
+          export PKGOCI_VERIFY_KEY="$RUNNER_TEMP/prefix/keys/pkgoci.pub"
           $B install hello
           "$RUNNER_TEMP/prefix/bin/hello" | grep -q "hello from pkgoci"
-          $B info hello
-          $B list | grep -q "hello 1.0.0"
-          $B push hello --version 2.0.0 --dir "$PLATFORM=/tmp/hello"
+          $B info hello | grep -q "Requires: libfoo"
+          $B list | grep -q "libfoo 1.0.0"
+          # Dependency protection.
+          $B uninstall libfoo 2>&1 | grep -q "required by hello"
+          # Unsigned and wrongly-signed packages are rejected.
+          $B push unsigned --version 1.0.0 --dir "$PLATFORM=/tmp/hello"
+          if $B install unsigned; then echo "unsigned install must fail"; exit 1; fi
+          $B keygen --out /tmp/otherkeys
+          if PKGOCI_VERIFY_KEY=/tmp/otherkeys/pkgoci.pub $B install hello --force; then echo "wrong-key install must fail"; exit 1; fi
+          # Upgrade flow.
+          $B push hello --version 2.0.0 --sign --requires libfoo --dir "$PLATFORM=/tmp/hello"
           $B upgrade
           $B list | grep -q "hello 2.0.0"
           $B cleanup
           $B uninstall hello
+          $B uninstall libfoo
           test ! -e "$RUNNER_TEMP/prefix/bin/hello"
       - uses: actions/upload-artifact@v4
         with:

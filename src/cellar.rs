@@ -17,6 +17,9 @@ pub struct Receipt {
     pub installed_at: u64,
     /// Paths linked into the prefix, relative to the prefix (e.g. `bin/jq`).
     pub linked: Vec<String>,
+    /// Package names this package requires at runtime.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 pub const RECEIPT_FILE: &str = ".pkgoci-receipt.json";
