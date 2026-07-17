@@ -122,7 +122,8 @@ jobs:
           $B verify libfoo
           # Conflicting constraints fail with a PubGrub explanation.
           $B push app --version 1.0.0 --sign --requires 'libfoo@^2' --dir "$PLATFORM=/tmp/hello"
-          $B install hello app --force 2>&1 | grep -q "version solving failed"
+          if out=$($B install hello app --force 2>&1); then echo "conflict install must fail"; exit 1; fi
+          echo "$out" | grep -q "version solving failed"
           # Signatures verify with stock cosign.
           cosign verify --key "$PKGOCI_VERIFY_KEY" --insecure-ignore-tlog=true \
             --allow-insecure-registry localhost:5001/ci/libfoo:1.4.2
