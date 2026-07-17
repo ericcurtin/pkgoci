@@ -39,6 +39,11 @@ impl Config {
         self.prefix.join("cache")
     }
 
+    /// Local build store (`pkgoci build` output, OCI image layouts).
+    pub fn store(&self) -> PathBuf {
+        self.prefix.join("store")
+    }
+
     /// Private key used by `push --sign`.
     pub fn signing_key(&self) -> PathBuf {
         std::env::var_os("PKGOCI_SIGNING_KEY")

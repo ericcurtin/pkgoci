@@ -108,10 +108,18 @@ jobs:
           printf '#!/bin/sh\necho "hello from pkgoci"\n' > /tmp/hello/bin/hello
           chmod +x /tmp/hello/bin/hello
           PLATFORM="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
-          mkdir -p /tmp/libfoo/lib && echo fake > /tmp/libfoo/lib/libfoo.so
+          mkdir -p /tmp/libfoo/out/lib && echo fake > /tmp/libfoo/out/lib/libfoo.so
+          mkdir -p /tmp/hello/out/bin && mv /tmp/hello/bin/hello /tmp/hello/out/bin/hello && rmdir /tmp/hello/bin
           $B keygen
-          for v in 1.0.0 1.4.2 2.0.0; do $B push libfoo --version "$v" --sign --dir "$PLATFORM=/tmp/libfoo"; done
-          $B push hello --version 1.0.0 --description "CI test" --sign --requires 'libfoo@^1' --dir "$PLATFORM=/tmp/hello"
+          # Docker-style flow: describe in a Pkgocifile, build, then push.
+          for v in 1.0.0 1.4.2 2.0.0; do
+            printf 'NAME libfoo\nVERSION %s\nDESCRIPTION Fake library\nLICENSE MIT\nPLATFORM %s ./out\n' "$v" "$PLATFORM" > /tmp/libfoo/Pkgocifile
+            $B build /tmp/libfoo
+            $B push "libfoo@$v" --sign
+          done
+          printf 'NAME hello\nVERSION 1.0.0\nDESCRIPTION CI test\nREQUIRES libfoo@^1\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
+          $B build /tmp/hello
+          $B push hello --sign   # newest built version is picked
           # Install with signature verification; the solver must pick the
           # newest libfoo satisfying ^1 (1.4.2), not 2.0.0.
           export PKGOCI_VERIFY_KEY="$RUNNER_TEMP/prefix/keys/pkgoci.pub"
@@ -121,7 +129,8 @@ jobs:
           $B list | grep -q "libfoo 1.4.2"
           $B verify libfoo
           # Conflicting constraints fail with a PubGrub explanation.
-          $B push app --version 1.0.0 --sign --requires 'libfoo@^2' --dir "$PLATFORM=/tmp/hello"
+          printf 'NAME app\nVERSION 1.0.0\nREQUIRES libfoo@^2\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
+          $B build /tmp/hello && $B push app --sign
           if out=$($B install hello app --force 2>&1); then echo "conflict install must fail"; exit 1; fi
           echo "$out" | grep -q "version solving failed"
           # Signatures verify with stock cosign.
@@ -130,12 +139,16 @@ jobs:
           # Dependency protection.
           $B uninstall libfoo 2>&1 | grep -q "required by hello"
           # Unsigned and wrongly-signed packages are rejected.
-          $B push unsigned --version 1.0.0 --dir "$PLATFORM=/tmp/hello"
+          printf 'NAME unsigned\nVERSION 1.0.0\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
+          $B build /tmp/hello && $B push unsigned
           if $B install unsigned; then echo "unsigned install must fail"; exit 1; fi
           $B keygen --out /tmp/otherkeys
           if PKGOCI_VERIFY_KEY=/tmp/otherkeys/pkgoci.pub $B install hello --force; then echo "wrong-key install must fail"; exit 1; fi
+          # Pushing an unbuilt package fails helpfully.
+          if $B push nothere; then echo "push of unbuilt package must fail"; exit 1; fi
           # Upgrade flow.
-          $B push hello --version 2.0.0 --sign --requires 'libfoo@^1' --dir "$PLATFORM=/tmp/hello"
+          printf 'NAME hello\nVERSION 2.0.0\nDESCRIPTION CI test\nREQUIRES libfoo@^1\nPLATFORM %s ./out\n' "$PLATFORM" > /tmp/hello/Pkgocifile
+          $B build /tmp/hello && $B push hello@2.0.0 --sign
           $B upgrade
           $B list | grep -q "hello 2.0.0"
           $B cleanup

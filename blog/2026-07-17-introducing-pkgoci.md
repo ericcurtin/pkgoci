@@ -53,11 +53,11 @@ pkgoci goes the rest of the way:
 
 ## Real version solving, without a solver service
 
-Packages declare semver-constrained requirements — one more standard
-annotation on the artifact:
+Packages declare semver-constrained requirements — one line in the
+`Pkgocifile`, one more standard annotation on the artifact:
 
-```sh
-pkgoci push tool --version 3.0.0 --requires 'libfoo@^1.2' --dir ...
+```text
+REQUIRES libfoo@^1.2
 ```
 
 At install time pkgoci reads the available versions straight from the
@@ -87,7 +87,7 @@ convention (the `sha256-<digest>.sig` tag and
 
 ```sh
 pkgoci keygen                       # standard PEM keypair
-pkgoci push mytool ... --sign
+pkgoci push mytool --sign
 
 # consumers opt in, then verification is enforced:
 export PKGOCI_VERIFY_KEY=/path/to/pkgoci.pub
@@ -144,26 +144,36 @@ The network-bound commands converge toward network latency, as they should —
 but the local commands you run dozens of times a day are one to two orders of
 magnitude faster.
 
-## Publishing is a first-class verb
+## Publishing works like Docker: build, then push
 
-There's no formula to write and no PR to send. If you can build your tool for
-a platform, you can publish it — dependencies, signature, and all — with one
-command:
+There's no formula to write and no PR to send. You describe the package once
+in a `Pkgocifile` — deliberately reminiscent of a Dockerfile — and then it's
+the two verbs every container user already knows:
 
-```sh
-pkgoci push mytool --version 1.2.3 --license MIT \
-  --description "My tool" \
-  --requires 'libfoo@^1.2' --sign \
-  --dir darwin/arm64=./out/mac-arm64 \
-  --dir linux/amd64=./out/linux-amd64 \
-  --dir linux/arm64=./out/linux-arm64 \
-  --dir windows/amd64=./out/win-amd64 \
-  --dir windows/arm64=./out/win-arm64
+```text
+# Pkgocifile
+NAME mytool
+VERSION 1.2.3
+DESCRIPTION My tool
+LICENSE MIT
+REQUIRES libfoo@^1.2
+PLATFORM darwin/arm64 ./out/mac-arm64
+PLATFORM linux/amd64 ./out/linux-amd64
+PLATFORM linux/arm64 ./out/linux-arm64
+PLATFORM windows/amd64 ./out/win-amd64
+PLATFORM windows/arm64 ./out/win-arm64
 ```
 
-Each directory becomes a `tar+gzip` layer, each platform a manifest, the set
-an image index tagged `1.2.3` and `latest`, plus a cosign-format signature —
-pushed to any registry you have credentials for. Your users then
+```sh
+pkgoci build              # like docker build: Pkgocifile -> local store
+pkgoci push mytool --sign # like docker push: local store -> registry
+```
+
+`build` packs each platform tree into a layer and writes a standard **OCI
+image layout** into the local store — every blob content-addressed, so the
+digest `build` prints is exactly the digest `push` tags and signs. `push`
+uploads it to any registry you have credentials for, as an image index tagged
+`1.2.3` and `latest`, plus the cosign-format signature. Your users then
 `PKGOCI_NAMESPACE=yourname pkgoci install mytool`.
 
 Distribution, hosting, bandwidth, auth, mirrors: all outsourced to registry
@@ -192,9 +202,11 @@ cargo build --release   # needs Rust + Go toolchains
 # Full roundtrip against a local registry:
 docker run -d --rm -p 5001:5000 registry:2
 export PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=test PKGOCI_PREFIX=/tmp/pkgoci
-mkdir -p /tmp/hello/bin && printf '#!/bin/sh\necho hi\n' > /tmp/hello/bin/hi && chmod +x /tmp/hello/bin/hi
+mkdir -p /tmp/hello/out/bin && printf '#!/bin/sh\necho hi\n' > /tmp/hello/out/bin/hi && chmod +x /tmp/hello/out/bin/hi
+printf 'NAME hello\nVERSION 1.0.0\nPLATFORM darwin/arm64 ./out\n' > /tmp/hello/Pkgocifile  # or linux/amd64, ...
 ./target/release/pkgoci keygen
-./target/release/pkgoci push hello --version 1.0.0 --sign --dir darwin/arm64=/tmp/hello  # or linux/amd64, ...
+./target/release/pkgoci build /tmp/hello
+./target/release/pkgoci push hello --sign
 PKGOCI_VERIFY_KEY=/tmp/pkgoci/keys/pkgoci.pub ./target/release/pkgoci install hello
 /tmp/pkgoci/bin/hi
 ```

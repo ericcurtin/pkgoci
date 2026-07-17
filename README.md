@@ -50,10 +50,10 @@ Add `$(pkgoci prefix)/bin` to your `PATH`.
 
 ### Dependencies
 
-Packages declare runtime dependencies with semver constraints (a
-`dev.pkgoci.requires` annotation): `--requires 'libfoo@^1.2'`,
-`'libfoo@>=1,<3'`, `'libfoo@~1.2.3'`, exact `'libfoo@1.2.3'`, or bare
-`libfoo` for any version. `pkgoci install` solves the whole graph with the
+Packages declare runtime dependencies with semver constraints (`REQUIRES` in
+the `Pkgocifile`, a `dev.pkgoci.requires` annotation on the artifact):
+`libfoo@^1.2`, `libfoo@>=1,<3`, `libfoo@~1.2.3`, exact `libfoo@1.2.3`, or
+bare `libfoo` for any version. `pkgoci install` solves the whole graph with the
 **PubGrub** algorithm against the versions available in the registry, picks
 the newest satisfying set, and installs it in parallel. Unsatisfiable
 constraints fail with a PubGrub derivation, e.g.:
@@ -71,7 +71,7 @@ package requires (override with `--force`).
 
 ```sh
 pkgoci keygen                          # ed25519 keypair (PEM) in <prefix>/keys
-pkgoci push mytool ... --sign          # cosign-compatible signature
+pkgoci push mytool --sign              # cosign-compatible signature
 export PKGOCI_VERIFY_KEY=/path/pkgoci.pub   # a .pub file, or a dir of them
 pkgoci install mytool                  # fails closed without a valid signature
 pkgoci verify mytool                   # explicit check
@@ -92,18 +92,31 @@ the install. Verification is built in: no external tooling is needed.
 
 ### Publishing
 
-Publishing (needs `PKGOCI_USERNAME`/`PKGOCI_PASSWORD`):
+Publishing is a two-step, Docker-style flow: describe the package once in a
+`Pkgocifile`, then `build` and `push` (push needs
+`PKGOCI_USERNAME`/`PKGOCI_PASSWORD`):
+
+```dockerfile
+# Pkgocifile
+NAME mytool
+VERSION 1.2.3
+DESCRIPTION My tool
+LICENSE MIT
+REQUIRES libfoo@^1.2
+PLATFORM darwin/arm64 ./out/mac-arm64
+PLATFORM linux/amd64 ./out/linux-amd64
+PLATFORM linux/arm64 ./out/linux-arm64
+PLATFORM windows/amd64 ./out/win-amd64
+PLATFORM windows/arm64 ./out/win-arm64
+```
 
 ```sh
-pkgoci push mytool --version 1.2.3 --license MIT \
-  --description "My tool" \
-  --requires libfoo --sign \
-  --dir darwin/arm64=./out/mac-arm64 \
-  --dir linux/amd64=./out/linux-amd64 \
-  --dir linux/arm64=./out/linux-arm64 \
-  --dir windows/amd64=./out/win-amd64 \
-  --dir windows/arm64=./out/win-arm64
+pkgoci build             # packs an OCI image layout into <prefix>/store
+pkgoci push mytool --sign
 ```
+
+`build` takes a directory containing a `Pkgocifile` (default `.`, or
+`-f/--file`); `push` takes `name` (newest built version) or `name@version`.
 
 ### Configuration
 
@@ -144,7 +157,9 @@ cargo build --release
 # End-to-end roundtrip against a local registry:
 docker run -d --rm --name reg -p 5001:5000 registry:2
 export PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=test PKGOCI_PREFIX=/tmp/pkgoci
-mkdir -p /tmp/hello/bin && printf '#!/bin/sh\necho hi\n' > /tmp/hello/bin/hi && chmod +x /tmp/hello/bin/hi
-./target/release/pkgoci push hello --version 1.0.0 --dir darwin/arm64=/tmp/hello
+mkdir -p /tmp/hello/out/bin && printf '#!/bin/sh\necho hi\n' > /tmp/hello/out/bin/hi && chmod +x /tmp/hello/out/bin/hi
+printf 'NAME hello\nVERSION 1.0.0\nPLATFORM darwin/arm64 ./out\n' > /tmp/hello/Pkgocifile  # or linux/amd64, ...
+./target/release/pkgoci build /tmp/hello
+./target/release/pkgoci push hello
 ./target/release/pkgoci install hello && /tmp/pkgoci/bin/hi
 ```

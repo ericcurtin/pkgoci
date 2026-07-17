@@ -6,7 +6,7 @@
 #
 #   docker run -d --rm --name pkgoci-bench-reg -p 5001:5000 registry:2
 #   PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=bench \
-#     pkgoci push hello --version 1.0.0 --dir "$(uname | tr A-Z a-z | sed s/darwin/darwin/)/arm64=<dir>"
+#     pkgoci build <dir-with-Pkgocifile> && pkgoci push hello
 set -euo pipefail
 
 PKGOCI=${PKGOCI:-$(dirname "$0")/../target/release/pkgoci}

@@ -521,70 +521,50 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-// ------------------------------------------------------------------- push
+// ------------------------------------------------------------------- build
 
-/// Publish a directory as a (multi-platform) package.
-/// `platform_dirs` entries look like `darwin/arm64=./out/mac-arm64`.
-#[allow(clippy::too_many_arguments)]
-pub fn push(
+/// Build a package described by a Pkgocifile into the local store as a
+/// standard OCI image layout (like `docker build`).
+pub fn build(
     cfg: &Config,
-    name: String,
-    version: String,
-    platform_dirs: Vec<String>,
-    description: Option<String>,
-    license: Option<String>,
-    requires: Vec<String>,
-    sign_it: bool,
+    path: std::path::PathBuf,
+    file: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    if platform_dirs.is_empty() {
-        bail!("at least one --dir os/arch=path is required");
+    let pkgocifile = file.unwrap_or_else(|| path.join(crate::pkgocifile::FILE_NAME));
+    let spec = crate::pkgocifile::parse(&pkgocifile)?;
+
+    let out = cfg.store().join(&spec.name).join(&spec.version);
+    if out.exists() {
+        std::fs::remove_dir_all(&out)?;
     }
-    let repo = cfg.repo_for(&name);
-    let client = Client::new(&cfg.registry);
-    let tmp = tempdir()?;
+    let blobs = out.join("blobs").join("sha256");
+    std::fs::create_dir_all(&blobs)?;
+    std::fs::write(out.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)?;
 
     let mut annotations = oci::Annotations::new();
-    annotations.insert(oci::ANNOTATION_VERSION.into(), version.clone());
-    if let Some(d) = &description {
+    annotations.insert(oci::ANNOTATION_VERSION.into(), spec.version.clone());
+    if let Some(d) = &spec.description {
         annotations.insert(oci::ANNOTATION_DESCRIPTION.into(), d.clone());
     }
-    if let Some(l) = &license {
+    if let Some(l) = &spec.license {
         annotations.insert(oci::ANNOTATION_LICENSES.into(), l.clone());
     }
-    if !requires.is_empty() {
-        for req in &requires {
-            let (_, constraint) = parse_requirement(req);
-            parse_range(constraint.as_deref()).map_err(|e| anyhow!("--requires {req}: {e}"))?;
-        }
-        annotations.insert(oci::ANNOTATION_REQUIRES.into(), requires.join(","));
+    if let Some(u) = &spec.url {
+        annotations.insert(oci::ANNOTATION_URL.into(), u.clone());
+    }
+    if !spec.requires.is_empty() {
+        annotations.insert(oci::ANNOTATION_REQUIRES.into(), spec.requires.join(","));
     }
 
     // Shared empty config blob.
-    let config_bytes = b"{}";
-    let config_digest = format!("sha256:{}", oci::sha256_hex(config_bytes));
-    let config_path = tmp.join("config.json");
-    std::fs::write(&config_path, config_bytes)?;
-    client.push_blob(&repo, &version, &config_digest, &config_path)?;
+    let config_digest = write_blob(&blobs, b"{}")?;
 
     let mut manifests = Vec::new();
-    for entry in &platform_dirs {
-        let (platform, dir) = entry
-            .split_once('=')
-            .ok_or_else(|| anyhow!("--dir must be os/arch=path, got: {entry}"))?;
-        let (os, arch) = platform
-            .split_once('/')
-            .ok_or_else(|| anyhow!("platform must be os/arch, got: {platform}"))?;
-
-        let layer_bytes = extract::pack_dir(std::path::Path::new(dir))?;
-        let layer_digest = format!("sha256:{}", oci::sha256_hex(&layer_bytes));
+    for (os, arch, dir) in &spec.platforms {
+        let layer_bytes = extract::pack_dir(dir)?;
         let layer_size = layer_bytes.len() as u64;
-        let layer_path = tmp.join(format!("{os}-{arch}.tar.gz"));
-        std::fs::write(&layer_path, &layer_bytes)?;
-        println!(
-            "Uploading {platform} layer ({})...",
-            cellar::human_bytes(layer_size)
-        );
-        client.push_blob(&repo, &version, &layer_digest, &layer_path)?;
+        let layer_digest = write_blob(&blobs, &layer_bytes)?;
+        println!("Packed {os}/{arch} ({})", cellar::human_bytes(layer_size));
 
         let manifest = oci::Manifest {
             schema_version: 2,
@@ -592,7 +572,7 @@ pub fn push(
             config: oci::Descriptor {
                 media_type: oci::MT_OCI_CONFIG.into(),
                 digest: config_digest.clone(),
-                size: config_bytes.len() as u64,
+                size: 2,
                 platform: None,
                 annotations: None,
             },
@@ -605,50 +585,159 @@ pub fn push(
             }],
             annotations: Some(annotations.clone()),
         };
-        let manifest_json = serde_json::to_string(&manifest)?;
-        let manifest_digest = format!("sha256:{}", oci::sha256_hex(manifest_json.as_bytes()));
-        client.push_manifest(
-            &repo,
-            &manifest_digest,
-            oci::MT_OCI_MANIFEST,
-            &manifest_json,
-        )?;
-
+        let manifest_json = serde_json::to_vec(&manifest)?;
+        let manifest_digest = write_blob(&blobs, &manifest_json)?;
         manifests.push(oci::Descriptor {
             media_type: oci::MT_OCI_MANIFEST.into(),
             digest: manifest_digest,
             size: manifest_json.len() as u64,
             platform: Some(oci::Platform {
-                os: os.into(),
-                architecture: arch.into(),
+                os: os.clone(),
+                architecture: arch.clone(),
             }),
             annotations: None,
         });
     }
 
+    let platforms = manifests.len();
     let index = oci::Index {
         schema_version: 2,
         media_type: Some(oci::MT_OCI_INDEX.into()),
         manifests,
         annotations: Some(annotations),
     };
-    let index_json = serde_json::to_string(&index)?;
-    let index_digest = format!("sha256:{}", oci::sha256_hex(index_json.as_bytes()));
+    let index_json = serde_json::to_vec(&index)?;
+    let index_digest = write_blob(&blobs, &index_json)?;
+
+    // OCI layout entrypoint, tagged with the version.
+    let mut ref_annotations = oci::Annotations::new();
+    ref_annotations.insert(
+        "org.opencontainers.image.ref.name".into(),
+        spec.version.clone(),
+    );
+    let layout_index = oci::Index {
+        schema_version: 2,
+        media_type: Some(oci::MT_OCI_INDEX.into()),
+        manifests: vec![oci::Descriptor {
+            media_type: oci::MT_OCI_INDEX.into(),
+            digest: index_digest.clone(),
+            size: index_json.len() as u64,
+            platform: None,
+            annotations: Some(ref_annotations),
+        }],
+        annotations: None,
+    };
+    std::fs::write(out.join("index.json"), serde_json::to_vec(&layout_index)?)?;
+
+    println!(
+        "Built {} {} ({platforms} platform(s), {index_digest})",
+        spec.name, spec.version
+    );
+    println!("Push it with: pkgoci push {}@{}", spec.name, spec.version);
+    Ok(())
+}
+
+fn write_blob(blobs: &std::path::Path, bytes: &[u8]) -> Result<String> {
+    let hex = oci::sha256_hex(bytes);
+    std::fs::write(blobs.join(&hex), bytes)?;
+    Ok(format!("sha256:{hex}"))
+}
+
+fn read_blob(dir: &std::path::Path, digest: &str) -> Result<Vec<u8>> {
+    let path = dir
+        .join("blobs")
+        .join("sha256")
+        .join(digest.trim_start_matches("sha256:"));
+    let bytes = std::fs::read(&path).with_context(|| format!("reading blob {}", path.display()))?;
+    if format!("sha256:{}", oci::sha256_hex(&bytes)) != digest {
+        bail!("corrupt blob in build store: {}", path.display());
+    }
+    Ok(bytes)
+}
+
+// ------------------------------------------------------------------- push
+
+/// Push a built package from the local store to the registry
+/// (like `docker push`).
+pub fn push(cfg: &Config, package: String, sign_it: bool) -> Result<()> {
+    let (name, version) = parse_requirement(&package);
+    let short = short_name(&package);
+    let version = match version {
+        Some(v) => v,
+        None => {
+            // Newest built version.
+            let mut versions: Vec<semver::Version> = std::fs::read_dir(cfg.store().join(&short))
+                .map_err(|_| anyhow!("no built package {short} (run `pkgoci build` first)"))?
+                .flatten()
+                .filter_map(|e| semver::Version::parse(&e.file_name().to_string_lossy()).ok())
+                .collect();
+            versions.sort();
+            versions
+                .pop()
+                .ok_or_else(|| anyhow!("no built versions of {short} in the store"))?
+                .to_string()
+        }
+    };
+    let dir = cfg.store().join(&short).join(&version);
+    if !dir.exists() {
+        bail!("{short} {version} is not built (run `pkgoci build` first)");
+    }
+
+    // Walk the layout: layout index -> package index -> platform manifests.
+    let layout_index: oci::Index = serde_json::from_slice(&std::fs::read(dir.join("index.json"))?)?;
+    let top = layout_index
+        .manifests
+        .first()
+        .ok_or_else(|| anyhow!("empty index.json in {}", dir.display()))?;
+    let index_bytes = read_blob(&dir, &top.digest)?;
+    let index: oci::Index = serde_json::from_slice(&index_bytes)?;
+
+    let repo = cfg.repo_for(&name);
+    let client = Client::new(&cfg.registry);
+    for desc in &index.manifests {
+        let manifest_bytes = read_blob(&dir, &desc.digest)?;
+        let manifest: oci::Manifest = serde_json::from_slice(&manifest_bytes)?;
+        let platform = desc
+            .platform
+            .as_ref()
+            .map(|p| format!("{}/{}", p.os, p.architecture))
+            .unwrap_or_default();
+        println!(
+            "Pushing {platform} ({})...",
+            cellar::human_bytes(manifest.layers.iter().map(|l| l.size).sum())
+        );
+        for blob in std::iter::once(&manifest.config).chain(&manifest.layers) {
+            let path = dir
+                .join("blobs")
+                .join("sha256")
+                .join(blob.digest.trim_start_matches("sha256:"));
+            client.push_blob(&repo, &version, &blob.digest, &path)?;
+        }
+        client.push_manifest(
+            &repo,
+            &desc.digest,
+            oci::MT_OCI_MANIFEST,
+            std::str::from_utf8(&manifest_bytes)?,
+        )?;
+    }
+    let index_json = std::str::from_utf8(&index_bytes)?;
     for tag in [version.as_str(), "latest"] {
-        client.push_manifest(&repo, tag, oci::MT_OCI_INDEX, &index_json)?;
+        client.push_manifest(&repo, tag, oci::MT_OCI_INDEX, index_json)?;
     }
 
     if sign_it {
         // Cosign-compatible signature: simple-signing payload as the layer
         // blob, base64 signature in the cosign annotation, stored under the
         // sha256-<digest>.sig tag. Verifiable with stock cosign.
+        let index_digest = &top.digest;
         let image_ref = format!("{}/{repo}", cfg.registry);
-        let payload_bytes = sign::payload(&image_ref, &index_digest);
+        let payload_bytes = sign::payload(&image_ref, index_digest);
         let signature_b64 = sign::sign(&cfg.signing_key(), &payload_bytes)?;
         let payload_digest = format!("sha256:{}", oci::sha256_hex(&payload_bytes));
-        let payload_path = tmp.join("sig.json");
+        let payload_path = std::env::temp_dir().join(format!("pkgoci-sig-{}", std::process::id()));
         std::fs::write(&payload_path, &payload_bytes)?;
         client.push_blob(&repo, &version, &payload_digest, &payload_path)?;
+        let _ = std::fs::remove_file(&payload_path);
 
         let mut sig_annotations = oci::Annotations::new();
         sig_annotations.insert(sign::ANNOTATION_SIGNATURE.into(), signature_b64);
@@ -657,8 +746,8 @@ pub fn push(
             media_type: Some(oci::MT_OCI_MANIFEST.into()),
             config: oci::Descriptor {
                 media_type: oci::MT_OCI_CONFIG.into(),
-                digest: config_digest.clone(),
-                size: config_bytes.len() as u64,
+                digest: format!("sha256:{}", oci::sha256_hex(b"{}")),
+                size: 2,
                 platform: None,
                 annotations: None,
             },
@@ -673,14 +762,13 @@ pub fn push(
         };
         client.push_manifest(
             &repo,
-            &sign::sig_tag(&index_digest),
+            &sign::sig_tag(index_digest),
             oci::MT_OCI_MANIFEST,
             &serde_json::to_string(&sig_manifest)?,
         )?;
         println!("Signed {index_digest} with {}", cfg.signing_key().display());
     }
 
-    let _ = std::fs::remove_dir_all(&tmp);
     println!(
         "Pushed {}/{repo}:{version} ({} platform(s))",
         cfg.registry,
@@ -724,10 +812,4 @@ pub fn keygen(cfg: &Config, out: Option<std::path::PathBuf>) -> Result<()> {
         public.display()
     );
     Ok(())
-}
-
-fn tempdir() -> Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("pkgoci-push-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
 }

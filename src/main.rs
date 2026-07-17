@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod extract;
 mod oci;
+mod pkgocifile;
 mod platform;
 mod registry;
 mod resolve;
@@ -56,22 +57,19 @@ enum Cmd {
     Cleanup,
     /// Print the install prefix
     Prefix,
-    /// Publish a directory tree as a package (requires credentials)
+    /// Build a package from a Pkgocifile into the local store
+    Build {
+        /// Directory containing the Pkgocifile
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Alternate Pkgocifile path
+        #[arg(short, long)]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Push a built package to the registry (requires credentials)
     Push {
-        name: String,
-        /// Package version, e.g. 1.2.3
-        #[arg(long)]
-        version: String,
-        /// Platform payloads: os/arch=path (repeatable), e.g. darwin/arm64=./out
-        #[arg(long = "dir")]
-        dirs: Vec<String>,
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long)]
-        license: Option<String>,
-        /// Runtime dependency (repeatable), e.g. --requires libfoo
-        #[arg(long = "requires")]
-        requires: Vec<String>,
+        /// Built package (name or name@version) from `pkgoci build`
+        package: String,
         /// Sign the package with the key from `pkgoci keygen`
         #[arg(long)]
         sign: bool,
@@ -114,24 +112,8 @@ fn run() -> Result<()> {
             println!("{}", cfg.prefix.display());
             Ok(())
         }
-        Cmd::Push {
-            name,
-            version,
-            dirs,
-            description,
-            license,
-            requires,
-            sign,
-        } => commands::push(
-            &cfg,
-            name,
-            version,
-            dirs,
-            description,
-            license,
-            requires,
-            sign,
-        ),
+        Cmd::Build { path, file } => commands::build(&cfg, path, file),
+        Cmd::Push { package, sign } => commands::push(&cfg, package, sign),
         Cmd::Keygen { out } => commands::keygen(&cfg, out),
         Cmd::Verify { package, key } => commands::verify(&cfg, package, key),
     }
