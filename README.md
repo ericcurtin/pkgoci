@@ -3,6 +3,9 @@
 A fast, native package manager backed by OCI registries — like Homebrew, but
 packages live on **Docker Hub** by default (any OCI registry works).
 
+> New here? Read the introduction:
+> [Introducing pkgoci: a package manager where every package is an OCI artifact](blog/2026-07-17-introducing-pkgoci.md)
+
 The CLI is written in Rust; all registry protocol handling is
 **containerd's distribution stack** (`core/remotes/docker` — resolver,
 token auth, fetcher, pusher, platform matching), linked into the binary as a

@@ -3,7 +3,7 @@ name = "pkgoci"
 version = "0.1.0"
 edition = "2021"
 description = "Fast, native package manager backed by OCI registries (Docker Hub by default)"
-license = "BSD-2-Clause"
+license = "Apache-2.0"
 repository = "https://github.com/ecurtin/pkgoci"
 
 [dependencies]
