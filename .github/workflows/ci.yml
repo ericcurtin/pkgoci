@@ -13,8 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      - run: gofmt -l go | tee /dev/stderr | wc -l | grep -q '^0$'
       - run: cargo clippy --release -- -D warnings
 
   build:
@@ -23,34 +28,71 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Go c-archives use the GNU ABI, so Windows builds use the
+          # -gnu/-gnullvm Rust targets with mingw toolchains instead of MSVC.
           - platform: darwin/arm64
             artifact: darwin-arm64
             runner: macos-14
+            bin: target/release/pkgoci
           - platform: linux/amd64
             artifact: linux-amd64
             runner: ubuntu-latest
+            bin: target/release/pkgoci
           - platform: linux/arm64
             artifact: linux-arm64
             runner: ubuntu-24.04-arm
+            bin: target/release/pkgoci
           - platform: windows/amd64
             artifact: windows-amd64
             runner: windows-latest
+            target: x86_64-pc-windows-gnu
+            bin: target/x86_64-pc-windows-gnu/release/pkgoci.exe
           - platform: windows/arm64
             artifact: windows-arm64
             runner: windows-11-arm
+            target: aarch64-pc-windows-gnullvm
+            bin: target/aarch64-pc-windows-gnullvm/release/pkgoci.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.sum
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - run: cargo test --release
+        with:
+          key: ${{ matrix.target || 'host' }}
+      - name: Set up mingw (windows/amd64)
+        if: matrix.platform == 'windows/amd64'
+        shell: bash
+        run: |
+          gcc --version || choco install mingw -y --no-progress
+          rustup target add x86_64-pc-windows-gnu
+      - name: Set up llvm-mingw (windows/arm64)
+        if: matrix.platform == 'windows/arm64'
+        shell: bash
+        run: |
+          curl -fsSLO https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-aarch64.zip
+          unzip -q llvm-mingw-20260616-ucrt-aarch64.zip -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/llvm-mingw-20260616-ucrt-aarch64/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-pc-windows-gnullvm
+          {
+            echo "PKGOCI_GO_CC=aarch64-w64-mingw32-clang"
+            echo "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang"
+          } >> "$GITHUB_ENV"
+      - name: Build
+        shell: bash
+        run: cargo build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+      - name: Test
+        shell: bash
+        run: cargo test --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Smoke test
         shell: bash
         run: |
-          ./target/release/pkgoci --version
-          ./target/release/pkgoci prefix
-          ./target/release/pkgoci list
-          ./target/release/pkgoci update
+          ./${{ matrix.bin }} --version
+          ./${{ matrix.bin }} prefix
+          ./${{ matrix.bin }} list
+          ./${{ matrix.bin }} update
       - name: End-to-end roundtrip (local registry)
         if: startsWith(matrix.platform, 'linux')
         shell: bash
@@ -58,7 +100,7 @@ jobs:
           docker run -d --rm --name reg -p 5001:5000 registry:2
           sleep 3
           export PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=ci PKGOCI_PREFIX="$RUNNER_TEMP/prefix"
-          B=./target/release/pkgoci
+          B=./${{ matrix.bin }}
           mkdir -p /tmp/hello/bin
           printf '#!/bin/sh\necho "hello from pkgoci"\n' > /tmp/hello/bin/hello
           chmod +x /tmp/hello/bin/hello
@@ -77,7 +119,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: pkgoci-${{ matrix.artifact }}
-          path: |
-            target/release/pkgoci
-            target/release/pkgoci.exe
+          path: ${{ matrix.bin }}
           if-no-files-found: error

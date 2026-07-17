@@ -76,36 +76,24 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load();
     match cli.cmd {
-        // Local commands: no async runtime, instant.
-        Cmd::List => commands::list(&cfg),
+        Cmd::Install { packages, force } => commands::install(&cfg, packages, force),
         Cmd::Uninstall { packages } => commands::uninstall(&cfg, packages),
+        Cmd::List => commands::list(&cfg),
+        Cmd::Info { package } => commands::info(&cfg, package),
+        Cmd::Search { term } => commands::search(&cfg, term),
+        Cmd::Upgrade { packages } => commands::upgrade(&cfg, packages),
         Cmd::Update => commands::update(),
         Cmd::Cleanup => commands::cleanup(&cfg),
         Cmd::Prefix => {
             println!("{}", cfg.prefix.display());
             Ok(())
         }
-        // Network commands.
-        cmd => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(async move {
-                match cmd {
-                    Cmd::Install { packages, force } => {
-                        commands::install(&cfg, packages, force).await
-                    }
-                    Cmd::Info { package } => commands::info(&cfg, package).await,
-                    Cmd::Search { term } => commands::search(&cfg, term).await,
-                    Cmd::Upgrade { packages } => commands::upgrade(&cfg, packages).await,
-                    Cmd::Push {
-                        name,
-                        version,
-                        dirs,
-                        description,
-                        license,
-                    } => commands::push(&cfg, name, version, dirs, description, license).await,
-                    _ => unreachable!(),
-                }
-            }),
+        Cmd::Push {
+            name,
+            version,
+            dirs,
+            description,
+            license,
+        } => commands::push(&cfg, name, version, dirs, description, license),
     }
 }

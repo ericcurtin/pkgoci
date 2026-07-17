@@ -1,8 +1,6 @@
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::cellar::{self, Receipt};
 use crate::config::Config;
@@ -20,40 +18,29 @@ fn parse_spec(spec: &str) -> (String, String) {
     }
 }
 
-fn bar_style() -> ProgressStyle {
-    ProgressStyle::with_template("{msg:20} {bar:30} {bytes}/{total_bytes} {bytes_per_sec}").unwrap()
-}
-
 // ---------------------------------------------------------------- install
 
-pub async fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
+pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
     if packages.is_empty() {
         bail!("no packages given");
     }
     let start = Instant::now();
-    let client = Arc::new(Client::new(&cfg.registry)?);
-    let cfg = Arc::new(Config {
-        prefix: cfg.prefix.clone(),
-        registry: cfg.registry.clone(),
-        namespace: cfg.namespace.clone(),
+    let client = Client::new(&cfg.registry);
+
+    let failures = std::thread::scope(|s| {
+        let handles: Vec<_> = packages
+            .iter()
+            .map(|spec| {
+                let (client, spec) = (&client, spec.clone());
+                s.spawn(move || install_one(cfg, client, &spec, force).map_err(|e| (spec, e)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("install thread panicked").err())
+            .map(|(spec, e)| eprintln!("error: {spec}: {e:#}"))
+            .count()
     });
-    let mp = MultiProgress::new();
-
-    let tasks: Vec<_> = packages
-        .iter()
-        .map(|spec| {
-            let (client, cfg, mp, spec) = (client.clone(), cfg.clone(), mp.clone(), spec.clone());
-            tokio::spawn(async move { install_one(&cfg, &client, &spec, force, &mp).await })
-        })
-        .collect();
-
-    let mut failures = 0;
-    for (task, spec) in tasks.into_iter().zip(&packages) {
-        if let Err(e) = task.await? {
-            eprintln!("error: {spec}: {e:#}");
-            failures += 1;
-        }
-    }
     if failures > 0 {
         bail!("{failures} package(s) failed to install");
     }
@@ -61,18 +48,12 @@ pub async fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result
     Ok(())
 }
 
-async fn install_one(
-    cfg: &Config,
-    client: &Client,
-    spec: &str,
-    force: bool,
-    mp: &MultiProgress,
-) -> Result<()> {
+fn install_one(cfg: &Config, client: &Client, spec: &str, force: bool) -> Result<()> {
     let (name, tag) = parse_spec(spec);
     let repo = cfg.repo_for(&name);
     let short = name.rsplit('/').next().unwrap_or(&name).to_string();
 
-    let resolved = client.resolve(&repo, &tag).await?;
+    let resolved = client.resolve(&repo, &tag)?;
     let version = resolved.version(&tag);
 
     if !force && cellar::read_receipt(cfg, &short, &version).is_some() {
@@ -87,7 +68,7 @@ async fn install_one(
         .ok_or_else(|| anyhow!("manifest for {repo}:{tag} has no layers"))?
         .clone();
 
-    // Download (or reuse cached, digest-verified archive).
+    // Download (or reuse the cached, digest-verified archive).
     std::fs::create_dir_all(cfg.cache())?;
     let ext = if layer.media_type.contains("zstd") {
         "tar.zst"
@@ -101,15 +82,11 @@ async fn install_one(
         &layer.digest.trim_start_matches("sha256:")[..12]
     ));
     if !cache_file.exists() {
-        let pb = mp.add(
-            ProgressBar::new(layer.size)
-                .with_style(bar_style())
-                .with_message(short.clone()),
+        println!(
+            "Downloading {short} {version} ({})...",
+            cellar::human_bytes(layer.size)
         );
-        client
-            .download_blob(&repo, &layer, &cache_file, &pb)
-            .await?;
-        pb.finish_and_clear();
+        client.download_blob(&repo, &tag, &layer, &cache_file)?;
     }
 
     // Extract into the keg.
@@ -121,12 +98,7 @@ async fn install_one(
         }
         std::fs::remove_dir_all(&keg)?;
     }
-    let (media_type, keg_clone, cache_clone) =
-        (layer.media_type.clone(), keg.clone(), cache_file.clone());
-    tokio::task::spawn_blocking(move || {
-        extract::extract_layer(&cache_clone, &media_type, &keg_clone)
-    })
-    .await??;
+    extract::extract_layer(&cache_file, &layer.media_type, &keg)?;
 
     // Remove any other installed version's links, then link the new keg.
     for old_version in cellar::installed_versions(cfg, &short) {
@@ -195,12 +167,12 @@ pub fn list(cfg: &Config) -> Result<()> {
 
 // ------------------------------------------------------------------- info
 
-pub async fn info(cfg: &Config, package: String) -> Result<()> {
+pub fn info(cfg: &Config, package: String) -> Result<()> {
     let (name, tag) = parse_spec(&package);
     let repo = cfg.repo_for(&name);
     let short = name.rsplit('/').next().unwrap_or(&name).to_string();
-    let client = Client::new(&cfg.registry)?;
-    let resolved = client.resolve(&repo, &tag).await?;
+    let client = Client::new(&cfg.registry);
+    let resolved = client.resolve(&repo, &tag)?;
     let version = resolved.version(&tag);
 
     println!("{short}: {version}");
@@ -237,30 +209,23 @@ pub async fn info(cfg: &Config, package: String) -> Result<()> {
 
 // ----------------------------------------------------------------- search
 
-pub async fn search(cfg: &Config, term: String) -> Result<()> {
+pub fn search(cfg: &Config, term: String) -> Result<()> {
     if !cfg.is_docker_hub() {
         bail!(
             "search is only supported on Docker Hub (registry: {})",
             cfg.registry
         );
     }
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("pkgoci/", env!("CARGO_PKG_VERSION")))
-        .build()?;
     let mut url = format!(
         "https://hub.docker.com/v2/repositories/{}/?page_size=100",
         cfg.namespace
     );
     let mut found = 0;
     loop {
-        let v: serde_json::Value = http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()
+        let v: serde_json::Value = ureq::get(&url)
+            .call()
             .with_context(|| format!("listing repositories under {}", cfg.namespace))?
-            .json()
-            .await?;
+            .into_json()?;
         for repo in v
             .get("results")
             .and_then(|r| r.as_array())
@@ -294,7 +259,7 @@ pub async fn search(cfg: &Config, term: String) -> Result<()> {
 
 // ---------------------------------------------------------------- upgrade
 
-pub async fn upgrade(cfg: &Config, packages: Vec<String>) -> Result<()> {
+pub fn upgrade(cfg: &Config, packages: Vec<String>) -> Result<()> {
     let targets: Vec<String> = if packages.is_empty() {
         cellar::list_installed(cfg)
             .into_iter()
@@ -308,7 +273,7 @@ pub async fn upgrade(cfg: &Config, packages: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let client = Client::new(&cfg.registry)?;
+    let client = Client::new(&cfg.registry);
     let mut outdated = Vec::new();
     for name in &targets {
         let (name, _) = parse_spec(name);
@@ -323,7 +288,7 @@ pub async fn upgrade(cfg: &Config, packages: Vec<String>) -> Result<()> {
             .as_ref()
             .map(|r| r.repo.clone())
             .unwrap_or_else(|| cfg.repo_for(&short));
-        let resolved = client.resolve(&repo, "latest").await?;
+        let resolved = client.resolve(&repo, "latest")?;
         let latest = resolved.version("latest");
         if latest != current {
             println!("{short} {current} -> {latest}");
@@ -339,8 +304,7 @@ pub async fn upgrade(cfg: &Config, packages: Vec<String>) -> Result<()> {
         cfg,
         outdated.iter().map(|(n, _)| n.clone()).collect(),
         false,
-    )
-    .await?;
+    )?;
     for (name, old_version) in outdated {
         if cellar::installed_versions(cfg, &name).len() > 1 {
             cellar::remove_keg(cfg, &name, &old_version)?;
@@ -398,7 +362,7 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
 
 /// Publish a directory as a (multi-platform) package.
 /// `platform_dirs` entries look like `darwin/arm64=./out/mac-arm64`.
-pub async fn push(
+pub fn push(
     cfg: &Config,
     name: String,
     version: String,
@@ -410,7 +374,8 @@ pub async fn push(
         bail!("at least one --dir os/arch=path is required");
     }
     let repo = cfg.repo_for(&name);
-    let client = Client::new(&cfg.registry)?;
+    let client = Client::new(&cfg.registry);
+    let tmp = tempdir()?;
 
     let mut annotations = oci::Annotations::new();
     annotations.insert(oci::ANNOTATION_VERSION.into(), version.clone());
@@ -422,11 +387,11 @@ pub async fn push(
     }
 
     // Shared empty config blob.
-    let config_bytes = b"{}".to_vec();
-    let config_digest = format!("sha256:{}", oci::sha256_hex(&config_bytes));
-    client
-        .push_blob(&repo, &config_digest, config_bytes.clone())
-        .await?;
+    let config_bytes = b"{}";
+    let config_digest = format!("sha256:{}", oci::sha256_hex(config_bytes));
+    let config_path = tmp.join("config.json");
+    std::fs::write(&config_path, config_bytes)?;
+    client.push_blob(&repo, &version, &config_digest, &config_path)?;
 
     let mut manifests = Vec::new();
     for entry in &platform_dirs {
@@ -440,11 +405,13 @@ pub async fn push(
         let layer_bytes = extract::pack_dir(std::path::Path::new(dir))?;
         let layer_digest = format!("sha256:{}", oci::sha256_hex(&layer_bytes));
         let layer_size = layer_bytes.len() as u64;
+        let layer_path = tmp.join(format!("{os}-{arch}.tar.gz"));
+        std::fs::write(&layer_path, &layer_bytes)?;
         println!(
             "Uploading {platform} layer ({})...",
             cellar::human_bytes(layer_size)
         );
-        client.push_blob(&repo, &layer_digest, layer_bytes).await?;
+        client.push_blob(&repo, &version, &layer_digest, &layer_path)?;
 
         let manifest = oci::Manifest {
             schema_version: 2,
@@ -465,21 +432,19 @@ pub async fn push(
             }],
             annotations: Some(annotations.clone()),
         };
-        let manifest_bytes = serde_json::to_vec(&manifest)?;
-        let manifest_digest = format!("sha256:{}", oci::sha256_hex(&manifest_bytes));
-        client
-            .push_manifest(
-                &repo,
-                &manifest_digest,
-                oci::MT_OCI_MANIFEST,
-                manifest_bytes.clone(),
-            )
-            .await?;
+        let manifest_json = serde_json::to_string(&manifest)?;
+        let manifest_digest = format!("sha256:{}", oci::sha256_hex(manifest_json.as_bytes()));
+        client.push_manifest(
+            &repo,
+            &manifest_digest,
+            oci::MT_OCI_MANIFEST,
+            &manifest_json,
+        )?;
 
         manifests.push(oci::Descriptor {
             media_type: oci::MT_OCI_MANIFEST.into(),
             digest: manifest_digest,
-            size: manifest_bytes.len() as u64,
+            size: manifest_json.len() as u64,
             platform: Some(oci::Platform {
                 os: os.into(),
                 architecture: arch.into(),
@@ -494,16 +459,21 @@ pub async fn push(
         manifests,
         annotations: Some(annotations),
     };
-    let index_bytes = serde_json::to_vec(&index)?;
+    let index_json = serde_json::to_string(&index)?;
     for tag in [version.as_str(), "latest"] {
-        client
-            .push_manifest(&repo, tag, oci::MT_OCI_INDEX, index_bytes.clone())
-            .await?;
+        client.push_manifest(&repo, tag, oci::MT_OCI_INDEX, &index_json)?;
     }
+    let _ = std::fs::remove_dir_all(&tmp);
     println!(
         "Pushed {}/{repo}:{version} ({} platform(s))",
         cfg.registry,
         index.manifests.len()
     );
     Ok(())
+}
+
+fn tempdir() -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("pkgoci-push-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }

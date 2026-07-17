@@ -1,20 +1,61 @@
-use std::collections::HashMap;
+//! Registry access via containerd's distribution stack
+//! (core/remotes/docker), linked in as a Go c-archive. See go/main.go.
+
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
-use futures_util::StreamExt;
-use indicatif::ProgressBar;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
-use reqwest::{Method, Response, StatusCode};
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use anyhow::{anyhow, bail, Result};
 
 use crate::oci::{self, Descriptor, Index, Manifest};
 
+extern "C" {
+    fn PkgociResolve(
+        reference: *const c_char,
+        os: *const c_char,
+        arch: *const c_char,
+    ) -> *mut c_char;
+    fn PkgociFetchBlob(
+        reference: *const c_char,
+        digest: *const c_char,
+        media_type: *const c_char,
+        size: i64,
+        dest: *const c_char,
+    ) -> *mut c_char;
+    fn PkgociPushBlob(
+        reference: *const c_char,
+        digest: *const c_char,
+        size: i64,
+        path: *const c_char,
+    ) -> *mut c_char;
+    fn PkgociPushManifest(
+        reference: *const c_char,
+        media_type: *const c_char,
+        body: *const c_char,
+    ) -> *mut c_char;
+    fn PkgociFree(p: *mut c_char);
+}
+
+fn cstring(s: &str) -> Result<CString> {
+    CString::new(s).map_err(|_| anyhow!("string contains NUL byte"))
+}
+
+/// Take ownership of a JSON result string returned by the Go side.
+fn take_result(ptr: *mut c_char) -> Result<serde_json::Value> {
+    assert!(!ptr.is_null());
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { PkgociFree(ptr) };
+    let v: serde_json::Value = serde_json::from_str(&s)?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        bail!("{e}");
+    }
+    Ok(v)
+}
+
 pub struct Client {
-    http: reqwest::Client,
     registry: String,
-    tokens: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 /// A platform-resolved manifest plus the index it came from (if any).
@@ -53,291 +94,102 @@ impl Resolved {
 }
 
 impl Client {
-    pub fn new(registry: &str) -> Result<Self> {
-        Ok(Client {
-            http: reqwest::Client::builder()
-                .user_agent(concat!("pkgoci/", env!("CARGO_PKG_VERSION")))
-                .build()?,
+    pub fn new(registry: &str) -> Self {
+        Client {
             registry: registry.to_string(),
-            tokens: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Full containerd reference, e.g. `registry-1.docker.io/pkgoci/jq:latest`
+    /// or `.../jq@sha256:...` when given a digest.
+    fn reference(&self, repo: &str, reference: &str) -> String {
+        if reference.starts_with("sha256:") {
+            format!("{}/{repo}@{reference}", self.registry)
+        } else {
+            format!("{}/{repo}:{reference}", self.registry)
+        }
+    }
+
+    /// Resolve a tag to the manifest for the host platform (descending
+    /// through an image index if present).
+    pub fn resolve(&self, repo: &str, tag: &str) -> Result<Resolved> {
+        let reference = self.reference(repo, tag);
+        let (r, o, a) = (
+            cstring(&reference)?,
+            cstring(crate::platform::os())?,
+            cstring(crate::platform::arch())?,
+        );
+        let v = take_result(unsafe { PkgociResolve(r.as_ptr(), o.as_ptr(), a.as_ptr()) }).map_err(
+            |e| {
+                if e.to_string().contains("not found") {
+                    anyhow!("package not found: {reference}")
+                } else {
+                    e
+                }
+            },
+        )?;
+        let manifest: Manifest = serde_json::from_value(v["manifest"].clone())?;
+        let index: Option<Index> = v
+            .get("index")
+            .map(|i| serde_json::from_value(i.clone()))
+            .transpose()?;
+        let manifest_digest = v["digest"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no digest in resolve result"))?
+            .to_string();
+        Ok(Resolved {
+            manifest,
+            manifest_digest,
+            index,
         })
     }
 
-    fn scheme(&self) -> &'static str {
-        // Local registries (e.g. `registry:2` for testing) speak plain HTTP.
-        if self.registry.starts_with("localhost") || self.registry.starts_with("127.") {
-            "http"
-        } else {
-            "https"
-        }
-    }
-
-    fn url(&self, repo: &str, path: &str) -> String {
-        format!("{}://{}/v2/{}/{}", self.scheme(), self.registry, repo, path)
-    }
-
-    /// Perform a v2 API request, transparently handling Bearer token
-    /// challenges (anonymous pull, or PKGOCI_USERNAME/PKGOCI_PASSWORD for push).
-    async fn request(
-        &self,
-        method: Method,
-        repo: &str,
-        path: &str,
-        accept: Option<&str>,
-        content_type: Option<&str>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Response> {
-        for attempt in 0..2 {
-            let mut req = self.http.request(method.clone(), self.url(repo, path));
-            if let Some(a) = accept {
-                req = req.header(ACCEPT, a);
-            }
-            if let Some(ct) = content_type {
-                req = req.header(CONTENT_TYPE, ct);
-            }
-            if let Some(b) = &body {
-                req = req.body(b.clone());
-            }
-            if let Some(tok) = self.tokens.lock().await.get(repo) {
-                req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
-            }
-            let resp = req.send().await?;
-            if resp.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
-                let challenge = resp
-                    .headers()
-                    .get(WWW_AUTHENTICATE)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| anyhow!("401 without WWW-Authenticate from {}", self.registry))?
-                    .to_string();
-                let token = self.fetch_token(&challenge).await?;
-                self.tokens.lock().await.insert(repo.to_string(), token);
-                continue;
-            }
-            return Ok(resp);
-        }
-        unreachable!()
-    }
-
-    async fn fetch_token(&self, challenge: &str) -> Result<String> {
-        let params = parse_challenge(challenge);
-        let realm = params
-            .get("realm")
-            .ok_or_else(|| anyhow!("no realm in auth challenge"))?;
-        let mut req = self.http.get(realm);
-        if let Some(service) = params.get("service") {
-            req = req.query(&[("service", service.as_str())]);
-        }
-        if let Some(scope) = params.get("scope") {
-            req = req.query(&[("scope", scope.as_str())]);
-        }
-        if let (Ok(user), Ok(pass)) = (
-            std::env::var("PKGOCI_USERNAME"),
-            std::env::var("PKGOCI_PASSWORD"),
-        ) {
-            req = req.basic_auth(user, Some(pass));
-        }
-        let resp = req
-            .send()
-            .await?
-            .error_for_status()
-            .context("token request failed")?;
-        let v: serde_json::Value = resp.json().await?;
-        v.get("token")
-            .or_else(|| v.get("access_token"))
-            .and_then(|t| t.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("no token in auth response"))
-    }
-
-    /// Fetch `manifests/<reference>` and, if it is an index, descend into the
-    /// manifest matching the host platform.
-    pub async fn resolve(&self, repo: &str, reference: &str) -> Result<Resolved> {
-        let resp = self
-            .request(
-                Method::GET,
-                repo,
-                &format!("manifests/{reference}"),
-                Some(oci::ACCEPT_ANY_MANIFEST),
-                None,
-                None,
-            )
-            .await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            bail!("package not found: {}/{repo}:{reference}", self.registry);
-        }
-        let resp = resp.error_for_status()?;
-        let media_type = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let bytes = resp.bytes().await?;
-        let digest = format!("sha256:{}", oci::sha256_hex(&bytes));
-
-        if media_type == oci::MT_OCI_INDEX || media_type == oci::MT_DOCKER_LIST {
-            let index: Index = serde_json::from_slice(&bytes)?;
-            let (os, arch) = (crate::platform::os(), crate::platform::arch());
-            let desc = index.select(os, arch).ok_or_else(|| {
-                anyhow!(
-                    "{repo}:{reference} has no build for {os}/{arch} (available: {})",
-                    index.platforms().join(", ")
-                )
-            })?;
-            let child_digest = desc.digest.clone();
-            let resp = self
-                .request(
-                    Method::GET,
-                    repo,
-                    &format!("manifests/{child_digest}"),
-                    Some(oci::ACCEPT_ANY_MANIFEST),
-                    None,
-                    None,
-                )
-                .await?
-                .error_for_status()?;
-            let bytes = resp.bytes().await?;
-            let manifest: Manifest = serde_json::from_slice(&bytes)?;
-            Ok(Resolved {
-                manifest,
-                manifest_digest: child_digest,
-                index: Some(index),
-            })
-        } else {
-            let manifest: Manifest = serde_json::from_slice(&bytes)?;
-            Ok(Resolved {
-                manifest,
-                manifest_digest: digest,
-                index: None,
-            })
-        }
-    }
-
-    /// Stream a blob to `dest`, verifying its sha256 digest.
-    pub async fn download_blob(
+    /// Stream a digest-verified blob to `dest`.
+    pub fn download_blob(
         &self,
         repo: &str,
+        tag: &str,
         desc: &Descriptor,
         dest: &Path,
-        pb: &ProgressBar,
     ) -> Result<()> {
-        let resp = self
-            .request(
-                Method::GET,
-                repo,
-                &format!("blobs/{}", desc.digest),
-                None,
-                None,
-                None,
+        let (r, d, m, p) = (
+            cstring(&self.reference(repo, tag))?,
+            cstring(&desc.digest)?,
+            cstring(&desc.media_type)?,
+            cstring(&dest.to_string_lossy())?,
+        );
+        take_result(unsafe {
+            PkgociFetchBlob(
+                r.as_ptr(),
+                d.as_ptr(),
+                m.as_ptr(),
+                desc.size as i64,
+                p.as_ptr(),
             )
-            .await?
-            .error_for_status()?;
-        pb.set_length(desc.size);
-        let tmp = dest.with_extension("part");
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        let mut hasher = Sha256::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-            pb.inc(chunk.len() as u64);
-        }
-        file.flush().await?;
-        drop(file);
-        let got = format!("sha256:{}", hex::encode(hasher.finalize()));
-        if got != desc.digest {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            bail!(
-                "digest mismatch for {}: expected {}, got {got}",
-                dest.display(),
-                desc.digest
-            );
-        }
-        tokio::fs::rename(&tmp, dest).await?;
+        })?;
         Ok(())
     }
 
-    /// Upload a blob if not already present. Returns without transfer when the
-    /// registry already has the digest.
-    pub async fn push_blob(&self, repo: &str, digest: &str, data: Vec<u8>) -> Result<()> {
-        let head = self
-            .request(
-                Method::HEAD,
-                repo,
-                &format!("blobs/{digest}"),
-                None,
-                None,
-                None,
-            )
-            .await?;
-        if head.status().is_success() {
-            return Ok(());
-        }
-        let resp = self
-            .request(Method::POST, repo, "blobs/uploads/", None, None, None)
-            .await?
-            .error_for_status()
-            .context("starting blob upload")?;
-        let location = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| anyhow!("no upload location returned"))?;
-        let mut url = if location.starts_with("http") {
-            location.to_string()
-        } else {
-            format!("{}://{}{}", self.scheme(), self.registry, location)
-        };
-        url.push_str(if url.contains('?') { "&" } else { "?" });
-        url.push_str(&format!("digest={digest}"));
-        let token = self.tokens.lock().await.get(repo).cloned();
-        let mut req = self
-            .http
-            .put(url)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(data);
-        if let Some(tok) = token {
-            req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
-        }
-        req.send()
-            .await?
-            .error_for_status()
-            .context("completing blob upload")?;
+    /// Upload a file as a blob (no-op if the registry already has the digest).
+    pub fn push_blob(&self, repo: &str, tag: &str, digest: &str, path: &Path) -> Result<()> {
+        let size = std::fs::metadata(path)?.len();
+        let (r, d, p) = (
+            cstring(&self.reference(repo, tag))?,
+            cstring(digest)?,
+            cstring(&path.to_string_lossy())?,
+        );
+        take_result(unsafe { PkgociPushBlob(r.as_ptr(), d.as_ptr(), size as i64, p.as_ptr()) })?;
         Ok(())
     }
 
-    pub async fn push_manifest(
-        &self,
-        repo: &str,
-        reference: &str,
-        media_type: &str,
-        body: Vec<u8>,
-    ) -> Result<()> {
-        self.request(
-            Method::PUT,
-            repo,
-            &format!("manifests/{reference}"),
-            None,
-            Some(media_type),
-            Some(body),
-        )
-        .await?
-        .error_for_status()
-        .with_context(|| format!("pushing manifest {repo}:{reference}"))?;
+    /// Upload a manifest or index under `tag`.
+    pub fn push_manifest(&self, repo: &str, tag: &str, media_type: &str, body: &str) -> Result<()> {
+        let (r, m, b) = (
+            cstring(&self.reference(repo, tag))?,
+            cstring(media_type)?,
+            cstring(body)?,
+        );
+        take_result(unsafe { PkgociPushManifest(r.as_ptr(), m.as_ptr(), b.as_ptr()) })?;
         Ok(())
     }
-}
-
-fn parse_challenge(header: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let header = header
-        .trim_start_matches("Bearer ")
-        .trim_start_matches("bearer ");
-    for part in header.split(',') {
-        if let Some((k, v)) = part.trim().split_once('=') {
-            out.insert(k.to_string(), v.trim_matches('"').to_string());
-        }
-    }
-    out
 }

@@ -1,8 +1,13 @@
 # pkgoci
 
 A fast, native package manager backed by OCI registries — like Homebrew, but
-100% Rust, and packages live on **Docker Hub** by default (any OCI registry
-works).
+packages live on **Docker Hub** by default (any OCI registry works).
+
+The CLI is written in Rust; all registry protocol handling is
+**containerd's distribution stack** (`core/remotes/docker` — resolver,
+token auth, fetcher, pusher, platform matching), linked into the binary as a
+Go c-archive rather than reimplemented. There is no daemon: the containerd
+code runs in-process.
 
 Unlike Homebrew, pkgoci supports native packages on **five** platforms:
 
@@ -21,10 +26,9 @@ containing the package tree (`bin/`, `lib/`, ...). Metadata uses standard
 `org.opencontainers.image.*` annotations. Versions are tags.
 
 There is no formula index to sync: metadata is resolved live from the
-registry, so `pkgoci update` is a no-op and `install` is one manifest GET, one
-platform-manifest GET, and one digest-verified blob download, extracted
-straight into the Cellar and symlinked (hardlinked/copied on Windows) into
-`<prefix>/bin`.
+registry, so `pkgoci update` is a no-op and `install` is one resolve, one
+digest-verified blob download (all via containerd), extracted straight into
+the Cellar and symlinked (hardlinked/copied on Windows) into `<prefix>/bin`.
 
 ## Usage
 
@@ -62,7 +66,8 @@ pkgoci push mytool --version 1.2.3 --license MIT \
 | `PKGOCI_NAMESPACE`  | `pkgoci`                |
 
 Names may include a namespace (`pkgoci install someorg/sometool`), and
-`localhost`/`127.*` registries are reached over plain HTTP for local testing.
+`localhost`/`127.*` registries are reached over plain HTTP (containerd's
+`MatchLocalhost`) for local testing.
 
 ## Benchmarks vs Homebrew
 
@@ -70,14 +75,18 @@ Names may include a namespace (`pkgoci install someorg/sometool`), and
 
 | Benchmark            | pkgoci   | brew     | Speedup |
 |----------------------|----------|----------|---------|
-| startup (`--version`)| 4.0 ms   | 372.4 ms | **93x** |
-| `prefix`             | 9.9 ms   | 56.3 ms  | **5.7x**|
-| `list` (installed)   | 7.5 ms   | 2.049 s  | **272x**|
-| `update`             | 9.8 ms   | 818.2 ms | **84x** |
-| `info` (network)     | 658 ms   | 1.246 s  | **1.9x**|
-| `search` (network)   | 361 ms   | 1.101 s  | **3.1x**|
+| startup (`--version`)| 11.5 ms  | 278.5 ms | **24x** |
+| `prefix`             | 7.3 ms   | 40.1 ms  | **5.5x**|
+| `list` (installed)   | 10.5 ms  | 1.130 s  | **108x**|
+| `update`             | 7.1 ms   | 2.807 s  | **398x**|
+| `info` (network)     | 1.048 s  | 1.227 s  | **1.2x**|
+| `search` (network)   | 385 ms   | 1.134 s  | **2.9x**|
 
 ## Building & testing
+
+Requires Rust and Go toolchains (Go builds the containerd c-archive via
+`build.rs`; on Windows use the `-gnu`/`-gnullvm` Rust targets with mingw,
+since Go archives use the GNU ABI).
 
 ```sh
 cargo build --release

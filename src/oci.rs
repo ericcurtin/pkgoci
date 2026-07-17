@@ -7,13 +7,6 @@ pub const MT_OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const MT_OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 pub const MT_LAYER_TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 pub const MT_LAYER_TAR_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
-pub const MT_DOCKER_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
-
-/// Accept header covering everything a `manifests/<ref>` GET may return.
-pub const ACCEPT_ANY_MANIFEST: &str = "application/vnd.oci.image.index.v1+json, \
-     application/vnd.oci.image.manifest.v1+json, \
-     application/vnd.docker.distribution.manifest.list.v2+json, \
-     application/vnd.docker.distribution.manifest.v2+json";
 
 pub const ANNOTATION_VERSION: &str = "org.opencontainers.image.version";
 pub const ANNOTATION_DESCRIPTION: &str = "org.opencontainers.image.description";
@@ -79,15 +72,6 @@ impl Index {
             .as_ref()
             .and_then(|a| a.get(key))
             .map(String::as_str)
-    }
-
-    /// Select the manifest descriptor matching `os`/`arch`.
-    pub fn select(&self, os: &str, arch: &str) -> Option<&Descriptor> {
-        self.manifests.iter().find(|d| {
-            d.platform
-                .as_ref()
-                .is_some_and(|p| p.os == os && p.architecture == arch)
-        })
     }
 
     pub fn platforms(&self) -> Vec<String> {
