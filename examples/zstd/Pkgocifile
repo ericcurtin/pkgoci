@@ -5,7 +5,9 @@ DESCRIPTION Zstandard, a fast lossless compression algorithm
 LICENSE BSD-3-Clause AND GPL-2.0-only
 URL https://facebook.github.io/zstd/
 FETCH https://github.com/facebook/zstd/releases/download/v${PKGOCI_VERSION}/zstd-${PKGOCI_VERSION}.tar.gz eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
-SOURCE .
+SOURCE
+ENV CFLAGS=-O2
 RUN make -C programs -j4 zstd
 RUN mkdir -p out/bin && cp programs/zstd out/bin/
+TEST ./out/bin/zstd --version
 OUTPUT ./out

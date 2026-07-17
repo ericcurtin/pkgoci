@@ -294,7 +294,26 @@ fn install_one(
             .manifest
             .annotation(oci::ANNOTATION_IMAGE)
             .unwrap_or(crate::sandbox::DEFAULT_IMAGE);
-        run_steps(&steps, &build_dir, &short, &version, image)?;
+        let env: Vec<(String, String)> =
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+                resolved
+                    .manifest
+                    .annotation(oci::ANNOTATION_ENV)
+                    .unwrap_or("{}"),
+            )
+            .context("parsing build env annotation")?
+            .into_iter()
+            .collect();
+        println!("Sandbox: {}", crate::sandbox::describe(image));
+        run_steps(&steps, "RUN", &build_dir, &short, &version, image, &env)?;
+        let tests: Vec<crate::pkgocifile::Step> = serde_json::from_str(
+            resolved
+                .manifest
+                .annotation(oci::ANNOTATION_TEST)
+                .unwrap_or("[]"),
+        )
+        .context("parsing test steps annotation")?;
+        run_steps(&tests, "TEST", &build_dir, &short, &version, image, &env)?;
         let output = build_dir.join(
             resolved
                 .manifest
@@ -646,10 +665,28 @@ pub fn build(
         .map(|rel| extract::pack_dir(&work.join(rel)))
         .transpose()?;
 
-    // Execute RUN steps on the host and pack their OUTPUT for the host
-    // platform (like docker build's RUN).
+    // Execute RUN steps sandboxed and pack their OUTPUT for the host
+    // platform (like docker build's RUN), then run TEST checks.
     if !spec.run.is_empty() {
-        run_steps(&spec.run, &work, &spec.name, &spec.version, &spec.image)?;
+        println!("Sandbox: {}", crate::sandbox::describe(&spec.image));
+        run_steps(
+            &spec.run,
+            "RUN",
+            &work,
+            &spec.name,
+            &spec.version,
+            &spec.image,
+            &spec.env,
+        )?;
+        run_steps(
+            &spec.tests,
+            "TEST",
+            &work,
+            &spec.name,
+            &spec.version,
+            &spec.image,
+            &spec.env,
+        )?;
         let output = work.join(&spec.output);
         if !output.is_dir() {
             bail!(
@@ -749,6 +786,16 @@ pub fn build(
         );
         src_annotations.insert(oci::ANNOTATION_OUTPUT.into(), spec.output.clone());
         src_annotations.insert(oci::ANNOTATION_IMAGE.into(), spec.image.clone());
+        if !spec.tests.is_empty() {
+            src_annotations.insert(
+                oci::ANNOTATION_TEST.into(),
+                serde_json::to_string(&spec.tests)?,
+            );
+        }
+        if !spec.env.is_empty() {
+            let env: std::collections::BTreeMap<_, _> = spec.env.iter().cloned().collect();
+            src_annotations.insert(oci::ANNOTATION_ENV.into(), serde_json::to_string(&env)?);
+        }
         let manifest = oci::Manifest {
             schema_version: 2,
             media_type: Some(oci::MT_OCI_MANIFEST.into()),
@@ -928,27 +975,34 @@ fn fetch_source(
         .with_context(|| format!("extracting {url} into {}", context.display()))
 }
 
-/// Run Pkgocifile RUN steps in `dir` inside the platform sandbox, skipping
-/// steps limited to other OSes.
+/// Run Pkgocifile RUN/TEST steps in `dir` inside the platform sandbox,
+/// skipping steps limited to other OSes.
 fn run_steps(
     steps: &[crate::pkgocifile::Step],
+    label: &str,
     dir: &std::path::Path,
     name: &str,
     version: &str,
     image: &str,
+    env: &[(String, String)],
 ) -> Result<()> {
-    println!("Sandbox: {}", crate::sandbox::describe(image));
+    let mut full_env = vec![
+        ("PKGOCI_NAME".to_string(), name.to_string()),
+        ("PKGOCI_VERSION".to_string(), version.to_string()),
+        ("PKGOCI_OS".to_string(), crate::platform::os().to_string()),
+        (
+            "PKGOCI_ARCH".to_string(),
+            crate::platform::arch().to_string(),
+        ),
+    ];
+    full_env.extend(env.iter().cloned());
     for step in steps.iter().filter(|s| s.applies_to(crate::platform::os())) {
-        println!("RUN {}", step.cmd);
-        let status = crate::sandbox::command(&step.cmd, dir, image)?
-            .env("PKGOCI_NAME", name)
-            .env("PKGOCI_VERSION", version)
-            .env("PKGOCI_OS", crate::platform::os())
-            .env("PKGOCI_ARCH", crate::platform::arch())
+        println!("{label} {}", step.cmd);
+        let status = crate::sandbox::command(&step.cmd, dir, image, &full_env)?
             .status()
             .with_context(|| format!("running {:?}", step.cmd))?;
         if !status.success() {
-            bail!("RUN {:?} failed with {status}", step.cmd);
+            bail!("{label} {:?} failed with {status}", step.cmd);
         }
     }
     Ok(())

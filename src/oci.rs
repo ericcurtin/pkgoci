@@ -17,6 +17,10 @@ pub const ANNOTATION_REQUIRES: &str = "dev.pkgoci.requires";
 pub const ANNOTATION_BUILD: &str = "dev.pkgoci.build";
 /// Directory the build commands produce, relative to the source root.
 pub const ANNOTATION_OUTPUT: &str = "dev.pkgoci.output";
+/// Post-build test commands (JSON steps).
+pub const ANNOTATION_TEST: &str = "dev.pkgoci.test";
+/// Environment variables for build/test steps (JSON object).
+pub const ANNOTATION_ENV: &str = "dev.pkgoci.env";
 /// Container image for sandboxed Linux builds.
 pub const ANNOTATION_IMAGE: &str = "dev.pkgoci.image";
 /// Rekor transparency log receipt (JSON) for the signature.

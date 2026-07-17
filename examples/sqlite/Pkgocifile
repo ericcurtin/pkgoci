@@ -5,7 +5,8 @@ DESCRIPTION Library that implements an embeddable SQL database engine
 LICENSE blessing
 URL https://sqlite.org
 FETCH https://www.sqlite.org/2026/sqlite-autoconf-3530300.tar.gz c917d7db16648ec95f714974ace5e5dcf46b7dc70e26600a0a102a3141125db0
-SOURCE .
+SOURCE
 RUN ./configure --prefix=$PWD/out
 RUN make -j4 install
+TEST ./out/bin/sqlite3 --version
 OUTPUT ./out

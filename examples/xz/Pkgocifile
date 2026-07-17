@@ -5,7 +5,9 @@ DESCRIPTION General-purpose data compression with high compression ratio
 LICENSE 0BSD
 URL https://tukaani.org/xz/
 FETCH https://github.com/tukaani-project/xz/releases/download/v${PKGOCI_VERSION}/xz-${PKGOCI_VERSION}.tar.gz 507825b599356c10dca1cd720c9d0d0c9d5400b9de300af00e4d1ea150795543
-SOURCE .
-RUN ./configure --prefix=$PWD/out --disable-shared --disable-nls --disable-doc
+SOURCE
+RUN ./configure --prefix=$PWD/out \
+    --disable-shared --disable-nls --disable-doc
 RUN make -j4 install
+TEST ./out/bin/xz --version
 OUTPUT ./out

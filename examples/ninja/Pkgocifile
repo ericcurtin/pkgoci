@@ -5,7 +5,8 @@ DESCRIPTION Small build system with a focus on speed
 LICENSE Apache-2.0
 URL https://ninja-build.org
 FETCH https://github.com/ninja-build/ninja/archive/refs/tags/v${PKGOCI_VERSION}.tar.gz f0055ad0369bf2e372955ba55128d000cfcc21777057806015b45e4accbebf23
-SOURCE .
+SOURCE
 RUN python3 configure.py --bootstrap
 RUN mkdir -p out/bin && cp ninja out/bin/
+TEST ./out/bin/ninja --version
 OUTPUT ./out

@@ -79,27 +79,41 @@ DESCRIPTION Powerful, efficient, lightweight, embeddable scripting language
 LICENSE MIT
 URL https://www.lua.org
 FETCH https://www.lua.org/ftp/lua-${PKGOCI_VERSION}.tar.gz 4f18ddae...629ae
-SOURCE .
+SOURCE
 RUN:darwin make macosx -j4
 RUN:linux make linux -j4
 RUN:windows make mingw -j4
 RUN make install INSTALL_TOP=$PWD/out
+TEST ./out/bin/lua -e 'print("ok")'
 OUTPUT ./out
 ```
 
-`FETCH` downloads a sha256-pinned upstream tarball (cached by digest) and
-extracts it into the build context; `RUN` steps execute on the host
-(`RUN:<os>` limits a step to one OS; `$PKGOCI_OS`/`$PKGOCI_ARCH` are set);
-`OUTPUT` is packed for the host platform. The context itself is never
-modified — fetching and building happen in a scratch copy, like a Docker
-build context.
+The context itself is never modified — fetching and building happen in a
+scratch copy, like a Docker build context. With `SOURCE`, the post-fetch
+source tree and its build recipe are published as part of the package, so
+`pkgoci install` transparently builds from source on platforms without
+prebuilt binaries — and `pkgoci install -s/--build-from-source` forces it.
+Signature verification happens before any build step runs, and `FETCH`
+digests are recorded in the build provenance.
 
-With `SOURCE`, the post-fetch source tree and its build recipe are published
-as part of the package, so `pkgoci install` transparently builds from source
-on platforms without prebuilt binaries — and
-`pkgoci install -s/--build-from-source` forces it. Signature verification
-happens before any build step runs, and `FETCH` digests are recorded in the
-build provenance.
+### Pkgocifile reference
+
+| Directive | Meaning |
+|-----------|---------|
+| `NAME <name>` | Package name (required) |
+| `VERSION <semver>` | Package version (required) |
+| `DESCRIPTION <text>` / `LICENSE <spdx>` / `URL <url>` | Metadata annotations |
+| `REQUIRES <name[@constraint]>` | Runtime dependency (repeatable; `^`, `~`, ranges, pins) |
+| `PLATFORM <os/arch> <dir>` | Prebuilt tree for a platform (repeatable) |
+| `FETCH <url> <sha256>` | Digest-pinned upstream tarball, extracted into the context (`${PKGOCI_VERSION}` substituted) |
+| `SOURCE [dir]` | Publish the (post-fetch) source tree, default `.` |
+| `FROM <image>` | Build image for the Linux Docker sandbox |
+| `ENV <KEY>=<VALUE>` | Environment for RUN/TEST steps (published with the recipe) |
+| `RUN [ :os ] <cmd>` | Sandboxed build step; `$PKGOCI_NAME/VERSION/OS/ARCH` set |
+| `TEST [ :os ] <cmd>` | Sandboxed post-build check (also run after install-time rebuilds) |
+| `OUTPUT <dir>` | Tree produced by RUN, packed for the host (default `./out`) |
+
+Lines may continue with a trailing backslash; `#` starts a comment.
 
 ### Build sandbox
 
@@ -107,7 +121,7 @@ build provenance.
 
 | OS      | Backend |
 |---------|---------|
-| Linux   | Docker (`--network=none`, work tree mounted, host uid/gid; image from `IMAGE`, default `buildpack-deps:bookworm`) |
+| Linux   | Docker (`--network=none`, work tree mounted, host uid/gid; image from `FROM`, default `buildpack-deps:bookworm`) |
 | macOS   | seatbelt (`sandbox-exec`, as Homebrew uses): writes confined to the work tree and temp dirs, network denied |
 | Windows | SAFER "constrained" restricted token; the work tree is ACLed for the RESTRICTED SID |
 

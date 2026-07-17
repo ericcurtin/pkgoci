@@ -9,15 +9,19 @@
 //! # Prebuilt trees:
 //! PLATFORM darwin/arm64 ./out/mac-arm64
 //! PLATFORM linux/amd64 ./out/linux-amd64
-//! # Or build from source (RUN executes on the host at build time; SOURCE is
-//! # published with the package so users on other platforms can build too).
-//! # FETCH downloads a digest-pinned upstream tarball into the context, and
-//! # RUN:<os> limits a step to one OS:
+//! # Or build from source. FETCH downloads a digest-pinned upstream tarball
+//! # into the build context; SOURCE publishes the tree so users on other
+//! # platforms can build too; RUN/TEST execute sandboxed (RUN:<os> limits a
+//! # step to one OS); FROM picks the Linux build image; lines may continue
+//! # with a trailing backslash:
+//! FROM docker.io/library/buildpack-deps:bookworm
 //! FETCH https://example.com/mytool-${PKGOCI_VERSION}.tar.gz <sha256>
-//! SOURCE .
-//! RUN:darwin make macosx
-//! RUN:linux make linux
-//! RUN make install INSTALL_TOP=$PWD/out
+//! SOURCE
+//! ENV CFLAGS=-O2
+//! RUN ./configure --prefix=$PWD/out \
+//!     --disable-nls
+//! RUN make -j4 install
+//! TEST ./out/bin/mytool --version
 //! OUTPUT ./out
 //! ```
 
@@ -29,7 +33,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 pub const FILE_NAME: &str = "Pkgocifile";
 
-/// A build step, optionally limited to one OS (`RUN:linux ...`).
+/// A build or test step, optionally limited to one OS (`RUN:linux ...`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,8 +57,12 @@ pub struct Spec {
     pub requires: Vec<String>,
     /// (os, arch, payload directory) — paths relative to the Pkgocifile.
     pub platforms: Vec<(String, String, PathBuf)>,
-    /// Build commands executed in the Pkgocifile's directory.
+    /// Build commands executed sandboxed in the work tree.
     pub run: Vec<Step>,
+    /// Post-build checks executed sandboxed in the work tree.
+    pub tests: Vec<Step>,
+    /// Environment variables for RUN/TEST steps.
+    pub env: Vec<(String, String)>,
     /// Directory `run` produces, packed for the host platform
     /// (and used at install time when building from source).
     pub output: String,
@@ -68,11 +76,54 @@ pub struct Spec {
     pub image: String,
 }
 
+/// Join backslash-continued lines, keeping the starting line number.
+fn logical_lines(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if pending.is_none() && (line.is_empty() || line.starts_with('#')) {
+            continue;
+        }
+        let (line, continued) = match line.strip_suffix('\\') {
+            Some(rest) => (rest.trim_end(), true),
+            None => (line, false),
+        };
+        let (start, acc) = match pending.take() {
+            Some((start, mut acc)) => {
+                acc.push(' ');
+                acc.push_str(line);
+                (start, acc)
+            }
+            None => (i, line.to_string()),
+        };
+        if continued {
+            pending = Some((start, acc));
+        } else {
+            out.push((start, acc));
+        }
+    }
+    if let Some(p) = pending {
+        out.push(p);
+    }
+    out
+}
+
 pub fn parse(path: &Path) -> Result<Spec> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let base = path.parent().unwrap_or(Path::new("."));
     let err = |lineno: usize, msg: String| anyhow!("{}:{}: {msg}", path.display(), lineno + 1);
+    let step = |lineno: usize, directive: &str, cmd: String| -> Result<Step> {
+        match directive.split_once(':') {
+            None => Ok(Step { os: None, cmd }),
+            Some((_, os)) if ["darwin", "linux", "windows"].contains(&os) => Ok(Step {
+                os: Some(os.to_string()),
+                cmd,
+            }),
+            Some((_, os)) => Err(err(lineno, format!("unknown OS {os:?}"))),
+        }
+    };
 
     let mut name = None;
     let mut version = None;
@@ -82,20 +133,21 @@ pub fn parse(path: &Path) -> Result<Spec> {
     let mut requires = Vec::new();
     let mut platforms: Vec<(String, String, PathBuf)> = Vec::new();
     let mut run: Vec<Step> = Vec::new();
+    let mut tests: Vec<Step> = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
     let mut output = "./out".to_string();
     let mut source = None;
     let mut fetches = Vec::new();
     let mut image = crate::sandbox::DEFAULT_IMAGE.to_string();
 
-    for (lineno, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    for (lineno, line) in logical_lines(&text) {
+        let (directive, rest) = match line.split_once(char::is_whitespace) {
+            Some((d, r)) => (d, r.trim().to_string()),
+            None => (line.as_str(), String::new()),
+        };
+        if rest.is_empty() && directive != "SOURCE" {
+            return Err(err(lineno, format!("directive {directive:?} has no value")));
         }
-        let (directive, rest) = line
-            .split_once(char::is_whitespace)
-            .ok_or_else(|| err(lineno, format!("directive {line:?} has no value")))?;
-        let rest = rest.trim().to_string();
         match directive {
             "NAME" => name = Some(rest),
             "VERSION" => {
@@ -130,17 +182,24 @@ pub fn parse(path: &Path) -> Result<Spec> {
                 }
                 platforms.push((os.to_string(), arch.to_string(), dir));
             }
-            "RUN" => run.push(Step {
-                os: None,
-                cmd: rest,
-            }),
             "OUTPUT" => output = rest,
-            "IMAGE" => image = rest,
+            "FROM" => image = rest,
+            "ENV" => {
+                let (k, v) = rest
+                    .split_once('=')
+                    .ok_or_else(|| err(lineno, "ENV needs KEY=VALUE".into()))?;
+                env.push((k.trim().to_string(), v.trim().to_string()));
+            }
             "SOURCE" => {
-                if !base.join(&rest).is_dir() {
-                    return Err(err(lineno, format!("no such directory: {rest}")));
+                let rel = if rest.is_empty() {
+                    ".".to_string()
+                } else {
+                    rest
+                };
+                if !base.join(&rel).is_dir() {
+                    return Err(err(lineno, format!("no such directory: {rel}")));
                 }
-                source = Some(rest);
+                source = Some(rel);
             }
             "FETCH" => {
                 let (url, sha) = rest
@@ -155,16 +214,8 @@ pub fn parse(path: &Path) -> Result<Spec> {
                 }
                 fetches.push((url.to_string(), sha.to_string()));
             }
-            run_os if run_os.starts_with("RUN:") => {
-                let os = &run_os[4..];
-                if !["darwin", "linux", "windows"].contains(&os) {
-                    return Err(err(lineno, format!("unknown RUN OS {os:?}")));
-                }
-                run.push(Step {
-                    os: Some(os.to_string()),
-                    cmd: rest,
-                });
-            }
+            d if d == "RUN" || d.starts_with("RUN:") => run.push(step(lineno, d, rest)?),
+            d if d == "TEST" || d.starts_with("TEST:") => tests.push(step(lineno, d, rest)?),
             other => return Err(err(lineno, format!("unknown directive {other:?}"))),
         }
     }
@@ -178,6 +229,8 @@ pub fn parse(path: &Path) -> Result<Spec> {
         requires,
         platforms,
         run,
+        tests,
+        env,
         output,
         source,
         fetches,
@@ -192,8 +245,8 @@ pub fn parse(path: &Path) -> Result<Spec> {
     if spec.source.is_some() && spec.run.is_empty() {
         bail!("{}: SOURCE requires RUN build steps", path.display());
     }
-    if spec.name.contains('/') || spec.name.contains('@') {
-        bail!("{}: NAME must be a plain package name", path.display());
+    if !spec.tests.is_empty() && spec.run.is_empty() {
+        bail!("{}: TEST requires RUN build steps", path.display());
     }
     Ok(spec)
 }

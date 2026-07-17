@@ -88,21 +88,25 @@ VERSION 5.4.8
 DESCRIPTION Powerful, efficient, lightweight, embeddable scripting language
 LICENSE MIT
 FETCH https://www.lua.org/ftp/lua-${PKGOCI_VERSION}.tar.gz 4f18ddae...629ae
-SOURCE .
+SOURCE
 RUN:darwin make macosx -j4
 RUN:linux make linux -j4
 RUN:windows make mingw -j4
 RUN make install INSTALL_TOP=$PWD/out
+TEST ./out/bin/lua -e 'print("ok")'
 OUTPUT ./out
 ```
 
 `FETCH` pulls the sha256-pinned upstream tarball (the digest also lands in
 the build provenance), `RUN` steps execute in a scratch copy of the context —
 never mutating it, like a Docker build — and `pkgoci build` packs `OUTPUT`
-for the host platform. And — this is the interesting part — `SOURCE`
-publishes the post-fetch source tree *and its build recipe* as one more
-platform entry in the same artifact (`source/all`, next to `darwin/arm64` and
-friends).
+for the host platform. `TEST` steps (Homebrew's `test do`, in one line each)
+gate the build, `ENV` sets build variables, `FROM` picks the Linux build
+image exactly like a Dockerfile, and long lines continue with a backslash.
+And — this is the interesting part — `SOURCE` publishes the post-fetch source
+tree *and its build recipe* as one more platform entry in the same artifact
+(`source/all`, next to `darwin/arm64` and friends), so `TEST` and `ENV`
+travel with the source and gate install-time rebuilds too.
 
 That gives pkgoci the same graceful degradation Homebrew gets from
 build-from-source formulas: on a platform with prebuilt binaries, `install`
@@ -119,8 +123,8 @@ your machine. Each OS uses its native isolation:
 
 - **Linux**: Docker — the work tree is the only mount, the container runs as
   your uid with `--network=none`, and the build environment is an image you
-  pick with `IMAGE` (default `buildpack-deps:bookworm`), Dockerfile-`FROM`
-  style.
+  pick with `FROM` (default `buildpack-deps:bookworm`), exactly like a
+  Dockerfile.
 - **macOS**: seatbelt (`sandbox-exec`) — the same mechanism Homebrew's build
   sandbox uses — with writes confined to the work tree and temp dirs and the
   network denied.

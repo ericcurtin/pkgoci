@@ -163,7 +163,17 @@ jobs:
           # ships with the package, and installs can rebuild it.
           mkdir -p /tmp/src/src
           printf '#include <stdio.h>\nint main(void){puts("compiled");return 0;}\n' > /tmp/src/src/hi.c
-          printf 'NAME srchello\nVERSION 1.0.0\nSOURCE .\nRUN mkdir -p out/bin && cc src/hi.c -o out/bin/srchello\nOUTPUT ./out\n' > /tmp/src/Pkgocifile
+          cat > /tmp/src/Pkgocifile <<'PKGEOF'
+          NAME srchello
+          VERSION 1.0.0
+          SOURCE
+          ENV GREETING=from-env
+          RUN mkdir -p out/bin && cc \
+              src/hi.c -o out/bin/srchello
+          TEST ./out/bin/srchello
+          TEST test "$GREETING" = from-env
+          OUTPUT ./out
+          PKGEOF
           $B build /tmp/src
           $B push srchello --sign
           $B install srchello

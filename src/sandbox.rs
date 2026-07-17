@@ -37,8 +37,8 @@ pub fn describe(image: &str) -> String {
 }
 
 /// Prepare a command that runs `cmd` inside the sandbox with `work` as its
-/// working directory.
-pub fn command(cmd: &str, work: &Path, image: &str) -> Result<Command> {
+/// working directory and `env` in its environment.
+pub fn command(cmd: &str, work: &Path, image: &str, env: &[(String, String)]) -> Result<Command> {
     if !enabled() {
         let (shell, flag) = if cfg!(windows) {
             ("cmd", "/C")
@@ -46,21 +46,24 @@ pub fn command(cmd: &str, work: &Path, image: &str) -> Result<Command> {
             ("sh", "-c")
         };
         let mut c = Command::new(shell);
-        c.arg(flag).arg(cmd).current_dir(work);
+        c.arg(flag)
+            .arg(cmd)
+            .current_dir(work)
+            .envs(env.iter().cloned());
         return Ok(c);
     }
     #[cfg(target_os = "linux")]
-    return linux_docker(cmd, work, image);
+    return linux_docker(cmd, work, image, env);
     #[cfg(target_os = "macos")]
-    return macos_seatbelt(cmd, work, image);
+    return macos_seatbelt(cmd, work, image, env);
     #[cfg(windows)]
-    return windows_restricted(cmd, work, image);
+    return windows_restricted(cmd, work, image, env);
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     bail!("no sandbox backend for this platform (set PKGOCI_SANDBOX=0 to build unsandboxed)");
 }
 
 #[cfg(target_os = "linux")]
-fn linux_docker(cmd: &str, work: &Path, image: &str) -> Result<Command> {
+fn linux_docker(cmd: &str, work: &Path, image: &str, env: &[(String, String)]) -> Result<Command> {
     use std::os::unix::fs::MetadataExt;
     if Command::new("docker").arg("--version").output().is_err() {
         bail!(
@@ -74,15 +77,20 @@ fn linux_docker(cmd: &str, work: &Path, image: &str) -> Result<Command> {
         .arg(format!("--user={}:{}", meta.uid(), meta.gid()))
         .arg(format!("--volume={}:/pkgoci-build", work.display()))
         .args(["--workdir=/pkgoci-build", "--env=HOME=/pkgoci-build"]);
-    for var in ["PKGOCI_NAME", "PKGOCI_VERSION", "PKGOCI_OS", "PKGOCI_ARCH"] {
-        c.arg(format!("--env={var}"));
+    for (k, v) in env {
+        c.arg(format!("--env={k}={v}"));
     }
     c.arg(image).args(["sh", "-c", cmd]);
     Ok(c)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_seatbelt(cmd: &str, work: &Path, _image: &str) -> Result<Command> {
+fn macos_seatbelt(
+    cmd: &str,
+    work: &Path,
+    _image: &str,
+    env: &[(String, String)],
+) -> Result<Command> {
     // Deny-by-exception profile in the style of Homebrew's build sandbox:
     // full read, writes only under the work tree and temp dirs, no network.
     let profile = format!(
@@ -106,12 +114,18 @@ fn macos_seatbelt(cmd: &str, work: &Path, _image: &str) -> Result<Command> {
     c.arg("-p")
         .arg(profile)
         .args(["sh", "-c", cmd])
-        .current_dir(work);
+        .current_dir(work)
+        .envs(env.iter().cloned());
     Ok(c)
 }
 
 #[cfg(windows)]
-fn windows_restricted(cmd: &str, work: &Path, _image: &str) -> Result<Command> {
+fn windows_restricted(
+    cmd: &str,
+    work: &Path,
+    _image: &str,
+    env: &[(String, String)],
+) -> Result<Command> {
     // Grant the RESTRICTED SID (S-1-5-12) access to the work tree so a
     // constrained-token process can build there, then run the step through
     // a helper that spawns it with a SAFER constrained token.
@@ -124,7 +138,11 @@ fn windows_restricted(cmd: &str, work: &Path, _image: &str) -> Result<Command> {
         bail!("icacls failed preparing the sandboxed work tree");
     }
     let mut c = Command::new(std::env::current_exe()?);
-    c.arg("__sandbox-exec").arg(work).arg(cmd).current_dir(work);
+    c.arg("__sandbox-exec")
+        .arg(work)
+        .arg(cmd)
+        .current_dir(work)
+        .envs(env.iter().cloned());
     // User-profile temp dirs deny the RESTRICTED SID; point temp at the
     // (RESTRICTED-granted) work tree for the build.
     c.env("TMP", work).env("TEMP", work);
