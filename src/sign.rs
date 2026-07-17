@@ -1,31 +1,46 @@
-//! Ed25519 package signing. Signatures are made over the root (tag-level)
-//! artifact digest and stored in the registry as an OCI artifact tagged
-//! `sha256-<digest>.sig` (the cosign "triangle" convention).
+//! Cosign-compatible package signing.
+//!
+//! Signatures use the sigstore "simple signing" payload and cosign's storage
+//! convention: an OCI artifact tagged `sha256-<digest>.sig` whose layer is
+//! the payload blob, carrying the signature in the
+//! `dev.cosignproject.cosign/signature` annotation. Keys are ed25519 in
+//! standard PEM (PKCS#8 private / SPKI public), so packages signed by
+//! `pkgoci push --sign` also verify with stock cosign:
+//!
+//! ```sh
+//! cosign verify --key pkgoci.pub --insecure-ignore-tlog=true <ref>
+//! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
+use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use serde::{Deserialize, Serialize};
 
-/// The payload stored as the signature artifact's layer blob.
-#[derive(Serialize, Deserialize)]
-pub struct SignaturePayload {
-    /// Digest that was signed, e.g. `sha256:...` of the image index.
-    pub digest: String,
-    /// Hex ed25519 signature over the digest string's bytes.
-    pub signature: String,
-    /// Hex ed25519 public key (informational; trust comes from the
-    /// verifier's own key file).
-    pub public_key: String,
-}
+pub const MT_SIMPLE_SIGNING: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
+pub const ANNOTATION_SIGNATURE: &str = "dev.cosignproject.cosign/signature";
 
 /// Tag under which the signature for `root_digest` is stored.
 pub fn sig_tag(root_digest: &str) -> String {
     format!("sha256-{}.sig", root_digest.trim_start_matches("sha256:"))
 }
 
-pub fn generate(dir: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+/// The sigstore simple-signing payload for `root_digest` of `image_ref`,
+/// serialized exactly as signed.
+pub fn payload(image_ref: &str, root_digest: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "critical": {
+            "identity": { "docker-reference": image_ref },
+            "image": { "docker-manifest-digest": root_digest },
+            "type": "cosign container image signature"
+        },
+        "optional": null
+    }))
+    .expect("payload serialization cannot fail")
+}
+
+pub fn generate(dir: &Path) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(dir)?;
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let key_path = dir.join("pkgoci.key");
@@ -33,47 +48,84 @@ pub fn generate(dir: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf)> 
     if key_path.exists() {
         bail!("refusing to overwrite existing key: {}", key_path.display());
     }
-    std::fs::write(&key_path, hex::encode(key.to_bytes()))?;
+    let pem = key
+        .to_pkcs8_pem(Default::default())
+        .map_err(|e| anyhow!("encoding private key: {e}"))?;
+    std::fs::write(&key_path, pem.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::write(&pub_path, hex::encode(key.verifying_key().to_bytes()))?;
+    let pub_pem = key
+        .verifying_key()
+        .to_public_key_pem(Default::default())
+        .map_err(|e| anyhow!("encoding public key: {e}"))?;
+    std::fs::write(&pub_path, pub_pem)?;
     Ok((key_path, pub_path))
 }
 
-fn read_hex_key(path: &Path, len: usize) -> Result<Vec<u8>> {
-    let hex_str =
-        std::fs::read_to_string(path).with_context(|| format!("reading key {}", path.display()))?;
-    let bytes =
-        hex::decode(hex_str.trim()).with_context(|| format!("decoding key {}", path.display()))?;
-    if bytes.len() != len {
-        bail!("{} is not a {len}-byte hex key", path.display());
-    }
-    Ok(bytes)
+fn load_signing_key(path: &Path) -> Result<SigningKey> {
+    let pem = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading signing key {} (run `pkgoci keygen`)",
+            path.display()
+        )
+    })?;
+    SigningKey::from_pkcs8_pem(&pem)
+        .map_err(|e| anyhow!("parsing signing key {}: {e}", path.display()))
 }
 
-pub fn sign(key_path: &Path, root_digest: &str) -> Result<SignaturePayload> {
-    let bytes: [u8; 32] = read_hex_key(key_path, 32)?.try_into().unwrap();
-    let key = SigningKey::from_bytes(&bytes);
-    Ok(SignaturePayload {
-        digest: root_digest.to_string(),
-        signature: hex::encode(key.sign(root_digest.as_bytes()).to_bytes()),
-        public_key: hex::encode(key.verifying_key().to_bytes()),
-    })
+fn load_verifying_key(path: &Path) -> Result<VerifyingKey> {
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("reading public key {}", path.display()))?;
+    VerifyingKey::from_public_key_pem(&pem)
+        .map_err(|e| anyhow!("parsing public key {}: {e}", path.display()))
 }
 
-pub fn verify(pub_path: &Path, root_digest: &str, payload: &SignaturePayload) -> Result<()> {
-    if payload.digest != root_digest {
-        bail!("signature is for {}, not {root_digest}", payload.digest);
+/// Expand a trust root (a `.pub` file, or a directory of them) into keys.
+pub fn load_trusted_keys(root: &Path) -> Result<Vec<(PathBuf, VerifyingKey)>> {
+    let mut keys = Vec::new();
+    if root.is_dir() {
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "pub") {
+                keys.push((path.clone(), load_verifying_key(&path)?));
+            }
+        }
+        if keys.is_empty() {
+            bail!("no .pub keys found in {}", root.display());
+        }
+    } else {
+        keys.push((root.to_path_buf(), load_verifying_key(root)?));
     }
-    let bytes: [u8; 32] = read_hex_key(pub_path, 32)?.try_into().unwrap();
-    let key = VerifyingKey::from_bytes(&bytes).map_err(|e| anyhow!("invalid public key: {e}"))?;
-    let sig_bytes: [u8; 64] = hex::decode(&payload.signature)
+    Ok(keys)
+}
+
+/// Sign `payload_bytes`, returning the base64 signature for the cosign
+/// annotation.
+pub fn sign(key_path: &Path, payload_bytes: &[u8]) -> Result<String> {
+    let key = load_signing_key(key_path)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(key.sign(payload_bytes).to_bytes()))
+}
+
+/// Verify a base64 cosign signature over `payload_bytes` against any trusted
+/// key. Returns the path of the key that matched.
+pub fn verify(
+    trusted: &[(PathBuf, VerifyingKey)],
+    payload_bytes: &[u8],
+    signature_b64: &str,
+) -> Result<PathBuf> {
+    let sig_bytes: [u8; 64] = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
         .ok()
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| anyhow!("malformed signature"))?;
-    key.verify(root_digest.as_bytes(), &Signature::from_bytes(&sig_bytes))
-        .map_err(|_| anyhow!("signature verification failed (wrong key or tampered artifact)"))
+    let sig = Signature::from_bytes(&sig_bytes);
+    for (path, key) in trusted {
+        if key.verify(payload_bytes, &sig).is_ok() {
+            return Ok(path.clone());
+        }
+    }
+    bail!("signature verification failed (no trusted key matches, or artifact was tampered with)")
 }

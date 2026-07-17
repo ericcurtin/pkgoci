@@ -7,7 +7,7 @@ experiment with a big premise: **what if a package manager didn't need any
 package infrastructure at all?**
 
 No formula repository. No package index to sync. No custom CDN, no custom
-metadata service, no custom protocol — not even for dependencies or
+metadata service, no custom protocol — not even for dependency resolution or
 signatures. Just OCI registries — the same infrastructure that already serves
 billions of container image pulls a day — holding ordinary, spec-compliant
 artifacts that any OCI tool can inspect.
@@ -16,8 +16,8 @@ artifacts that any OCI tool can inspect.
 pkgoci install hello
 ```
 
-That one command resolves a manifest, verifies a signature, pulls the
-package's dependencies, downloads digest-verified blobs from Docker Hub,
+That one command resolves the package, solves its dependency constraints,
+verifies signatures, downloads digest-verified blobs from Docker Hub,
 extracts everything into a Homebrew-style Cellar, and links the binaries into
 your `PATH`. That's the whole trick.
 
@@ -51,66 +51,70 @@ pkgoci goes the rest of the way:
   variable to point at any OCI registry, including a `registry:2` container
   on localhost for hacking.
 
-## Don't reimplement the registry — embed containerd
+## Real version solving, without a solver service
 
-Registry protocol code is deceptively fiddly: token challenges, anonymous
-auth, manifest lists vs indexes, digest verification, resumable pushes,
-platform variant matching. Rather than write another implementation of all
-that, pkgoci links in the code that already handles more registry traffic
-than anything else on earth: **containerd's distribution stack**.
-
-The Go packages containerd itself uses to talk to registries
-(`core/remotes/docker`: resolver, authorizer, fetcher, pusher, plus its
-platform matcher) are compiled with `go build -buildmode=c-archive` and
-statically linked into the Rust binary. Four C functions cross the FFI
-boundary — resolve, fetch blob, push blob, push manifest — with JSON across
-the seam. There is **no daemon**: containerd's client code runs in-process,
-and the result is still a single self-contained executable.
-
-The Rust side keeps everything that makes it a package manager rather than a
-container tool: the CLI, the Cellar layout and receipts, linking/shims,
-tar+gzip/zstd extraction, dependency resolution, signing, upgrades, cleanup.
-
-## Dependencies, without a solver service
-
-A package can declare what it needs at runtime — one more standard
-annotation on the artifact, `dev.pkgoci.requires`:
+Packages declare semver-constrained requirements — one more standard
+annotation on the artifact:
 
 ```sh
-pkgoci push mytool --version 1.2.3 --requires libfoo --dir ...
+pkgoci push tool --version 3.0.0 --requires 'libfoo@^1.2' --dir ...
 ```
 
-At install time pkgoci expands the dependency graph breadth-first straight
-from the registry, deduplicates it, and — because dependencies are
-runtime-only, not install-time — fetches and installs the entire plan **in
-parallel**. Receipts remember the edges, so `pkgoci uninstall libfoo` refuses
-to strand a package that still needs it (override with `--force`), and
-`pkgoci info` shows the `Requires:` list.
+At install time pkgoci reads the available versions straight from the
+registry's tags and solves the whole graph with **PubGrub**, the version
+solving algorithm behind modern package managers. Constraints compose across
+the graph (`^1.2`, `~1.2.3`, `>=1,<3`, exact pins, CLI ranges like
+`pkgoci install 'libfoo@>=1,<1.1'`), the newest satisfying set wins, and the
+plan installs in parallel. When constraints can't be satisfied, you get
+PubGrub's derivation instead of a mystery:
 
-No lockfile server, no dependency database: the graph lives on the artifacts
-themselves.
+```
+Because tool depends on libfoo 1.0.0 <= v < 2.0.0 and app 1.0.0 depends on
+libfoo 2.0.0 <= v < 3.0.0, app 1.0.0, tool ∗ are incompatible.
+```
 
-## Signatures, stored where the packages are
+Receipts remember the edges, so `pkgoci uninstall libfoo` refuses to strand a
+package that still needs it. No lockfile server, no dependency database: the
+graph lives on the artifacts themselves.
 
-Signing follows the same rule — no new infrastructure. pkgoci uses plain
-ed25519 keypairs and stores each signature *in the registry, next to the
-package*, as another OCI artifact under the cosign-style triangle tag
-`sha256-<digest>.sig`:
+## Signatures cosign can verify
+
+Signing follows the same rule — no new infrastructure, and no new formats.
+pkgoci signs the sigstore *simple signing* payload with an ed25519 key and
+stores it in the registry, next to the package, using cosign's storage
+convention (the `sha256-<digest>.sig` tag and
+`dev.cosignproject.cosign/signature` annotation):
 
 ```sh
-pkgoci keygen                       # keypair in <prefix>/keys
-pkgoci push mytool ... --sign       # signs the package index digest
+pkgoci keygen                       # standard PEM keypair
+pkgoci push mytool ... --sign
 
 # consumers opt in, then verification is enforced:
 export PKGOCI_VERIFY_KEY=/path/to/pkgoci.pub
 pkgoci install mytool
+pkgoci verify mytool                # explicit check
 ```
 
-With `PKGOCI_VERIFY_KEY` set, installs **fail closed**: a missing signature,
-a signature made with a different key, or a tampered artifact all abort the
-install — and that applies to every dependency in the plan, not just the
-package you asked for. The digest chain does the rest: the signature covers
-the index, the index pins the manifests, the manifests pin the blobs.
+Because the format is cosign's, the industry-standard tooling agrees with us:
+
+```sh
+$ cosign verify --key pkgoci.pub --insecure-ignore-tlog=true .../mytool:1.2.3
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - The signatures were verified against the specified public key
+```
+
+With `PKGOCI_VERIFY_KEY` set (a key, or a directory of trusted keys),
+installs **fail closed**: a missing signature, a signature from an untrusted
+key, or a tampered artifact aborts the install — for every dependency in the
+plan, not just the package you asked for. The digest chain does the rest: the
+signature covers the index, the index pins the manifests, the manifests pin
+the blobs.
+
+For comparison, Homebrew's attestation verification is opt-in, applies to
+homebrew-core bottles, and shells out to the external `gh` binary; pkgoci's
+verification is built in, works for any publisher on any registry, and
+enforces the entire dependency graph.
 
 ## It's fast — measurably faster than Homebrew on everything
 
@@ -149,7 +153,7 @@ command:
 ```sh
 pkgoci push mytool --version 1.2.3 --license MIT \
   --description "My tool" \
-  --requires libfoo --sign \
+  --requires 'libfoo@^1.2' --sign \
   --dir darwin/arm64=./out/mac-arm64 \
   --dir linux/amd64=./out/linux-amd64 \
   --dir linux/arm64=./out/linux-arm64 \
@@ -158,9 +162,9 @@ pkgoci push mytool --version 1.2.3 --license MIT \
 ```
 
 Each directory becomes a `tar+gzip` layer, each platform a manifest, the set
-an image index tagged `1.2.3` and `latest`, plus a signature artifact —
-pushed through containerd's pusher to any registry you have credentials for.
-Your users then `PKGOCI_NAMESPACE=yourname pkgoci install mytool`.
+an image index tagged `1.2.3` and `latest`, plus a cosign-format signature —
+pushed to any registry you have credentials for. Your users then
+`PKGOCI_NAMESPACE=yourname pkgoci install mytool`.
 
 Distribution, hosting, bandwidth, auth, mirrors: all outsourced to registry
 operators who already solved those problems for containers.
@@ -172,15 +176,12 @@ This is a young project, and I'd rather list its gaps than oversell it:
 - **There's no package catalog yet.** The design removes the need for
   *infrastructure*, not for *packages*. The default `pkgoci` namespace on
   Docker Hub needs to be populated before `pkgoci install jq` means anything.
-- **Dependency resolution is deliberately simple.** Requirements are package
-  names (optionally pinned versions) — there is no version-constraint solver
-  and no conflict resolution. That's the right shape for distributing tools
-  and their runtime libraries; it does not replace Homebrew's formula DSL,
-  build-from-source support, casks, services, or two decades of ecosystem.
-- **Signing is keypair-based.** There's no sigstore-style keyless flow or
-  transparency log yet; key distribution is up to you. Because signatures are
-  ordinary OCI artifacts in cosign's tag convention, that upgrade path slots
-  in naturally later.
+- **It distributes binaries; it doesn't build them.** There is no
+  build-from-source path, no formula DSL, no casks or services — Homebrew's
+  two decades of ecosystem are not what this replaces.
+- **Signing is key-based.** There's no keyless flow or transparency log yet;
+  key distribution is up to you. Because the format is already cosign's, that
+  upgrade path slots in naturally later.
 
 ## Try it
 

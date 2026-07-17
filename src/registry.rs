@@ -33,6 +33,7 @@ extern "C" {
         media_type: *const c_char,
         body: *const c_char,
     ) -> *mut c_char;
+    fn PkgociListTags(host: *const c_char, repo: *const c_char) -> *mut c_char;
     fn PkgociFree(p: *mut c_char);
 }
 
@@ -59,6 +60,7 @@ pub struct Client {
 }
 
 /// A platform-resolved manifest plus the index it came from (if any).
+#[derive(Clone)]
 pub struct Resolved {
     pub manifest: Manifest,
     pub manifest_digest: String,
@@ -188,6 +190,20 @@ impl Client {
         );
         take_result(unsafe { PkgociPushBlob(r.as_ptr(), d.as_ptr(), size as i64, p.as_ptr()) })?;
         Ok(())
+    }
+
+    /// List a repository's tags.
+    pub fn list_tags(&self, repo: &str) -> Result<Vec<String>> {
+        let (h, r) = (cstring(&self.registry)?, cstring(repo)?);
+        let v = take_result(unsafe { PkgociListTags(h.as_ptr(), r.as_ptr()) })?;
+        Ok(v.get("tags")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Upload a manifest or index under `tag`.

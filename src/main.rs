@@ -5,6 +5,7 @@ mod extract;
 mod oci;
 mod platform;
 mod registry;
+mod resolve;
 mod sign;
 
 use anyhow::Result;
@@ -81,6 +82,13 @@ enum Cmd {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
+    /// Verify a package's signature
+    Verify {
+        package: String,
+        /// Public key or directory of .pub keys (default: PKGOCI_VERIFY_KEY)
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() {
@@ -125,5 +133,6 @@ fn run() -> Result<()> {
             sign,
         ),
         Cmd::Keygen { out } => commands::keygen(&cfg, out),
+        Cmd::Verify { package, key } => commands::verify(&cfg, package, key),
     }
 }

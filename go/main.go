@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"unsafe"
@@ -34,16 +35,19 @@ func init() {
 
 const mediaTypeDockerManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
 
-func newResolver() remotes.Resolver {
+func registryHosts() docker.RegistryHosts {
 	authorizer := docker.NewDockerAuthorizer(docker.WithAuthCreds(
 		func(host string) (string, string, error) {
 			return os.Getenv("PKGOCI_USERNAME"), os.Getenv("PKGOCI_PASSWORD"), nil
 		}))
-	hosts := docker.ConfigureDefaultRegistries(
+	return docker.ConfigureDefaultRegistries(
 		docker.WithPlainHTTP(docker.MatchLocalhost),
 		docker.WithAuthorizer(authorizer),
 	)
-	return docker.NewResolver(docker.ResolverOptions{Hosts: hosts})
+}
+
+func newResolver() remotes.Resolver {
+	return docker.NewResolver(docker.ResolverOptions{Hosts: registryHosts()})
 }
 
 func jsonResult(v any, err error) *C.char {
@@ -229,6 +233,92 @@ func PkgociPushManifest(cRef, cMediaType, cBody *C.char) *C.char {
 		Size:      int64(len(body)),
 	}
 	return jsonResult(nil, pushWriter(context.Background(), C.GoString(cRef), desc, strings.NewReader(string(body))))
+}
+
+// PkgociListTags lists a repository's tags via the registry API, using
+// containerd's host configuration and authorizer (token auth, docker.io
+// mapping, localhost plain HTTP), following pagination.
+//
+//export PkgociListTags
+func PkgociListTags(cHost, cRepo *C.char) *C.char {
+	host, repo := C.GoString(cHost), C.GoString(cRepo)
+	ctx := context.Background()
+	regHosts, err := registryHosts()(host)
+	if err != nil {
+		return jsonResult(nil, err)
+	}
+	if len(regHosts) == 0 {
+		return jsonResult(nil, fmt.Errorf("no registry host configuration for %s", host))
+	}
+	h := regHosts[0]
+	url := fmt.Sprintf("%s://%s%s/%s/tags/list?n=1000", h.Scheme, h.Host, h.Path, repo)
+
+	var tags []string
+	for url != "" {
+		body, next, err := authorizedGet(ctx, h, url)
+		if err != nil {
+			return jsonResult(nil, err)
+		}
+		var page struct {
+			Tags []string `json:"tags"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return jsonResult(nil, err)
+		}
+		tags = append(tags, page.Tags...)
+		url = next
+	}
+	return jsonResult(map[string][]string{"tags": tags}, nil)
+}
+
+func authorizedGet(ctx context.Context, h docker.RegistryHost, url string) (body []byte, next string, err error) {
+	client := h.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, "", err
+		}
+		if h.Authorizer != nil {
+			if err := h.Authorizer.Authorize(ctx, req); err != nil {
+				return nil, "", err
+			}
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, "", err
+		}
+		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 && h.Authorizer != nil {
+			err = h.Authorizer.AddResponses(ctx, []*http.Response{resp})
+			resp.Body.Close()
+			if err != nil {
+				return nil, "", err
+			}
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, "", fmt.Errorf("listing tags: %s returned %s", url, resp.Status)
+		}
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, "", err
+		}
+		if link := resp.Header.Get("Link"); link != "" {
+			if start, end := strings.Index(link, "<"), strings.Index(link, ">"); start >= 0 && end > start {
+				rel := link[start+1 : end]
+				if strings.HasPrefix(rel, "/") {
+					next = fmt.Sprintf("%s://%s%s", h.Scheme, h.Host, rel)
+				} else {
+					next = rel
+				}
+			}
+		}
+		return body, next, nil
+	}
+	return nil, "", fmt.Errorf("unauthorized listing tags at %s", url)
 }
 
 //export PkgociFree

@@ -50,24 +50,45 @@ Add `$(pkgoci prefix)/bin` to your `PATH`.
 
 ### Dependencies
 
-Packages can declare runtime dependencies (a `dev.pkgoci.requires`
-annotation). `pkgoci install` expands the graph, deduplicates it, and installs
-everything in parallel; `pkgoci uninstall` refuses to remove a package that
-another installed package requires (override with `--force`).
+Packages declare runtime dependencies with semver constraints (a
+`dev.pkgoci.requires` annotation): `--requires 'libfoo@^1.2'`,
+`'libfoo@>=1,<3'`, `'libfoo@~1.2.3'`, exact `'libfoo@1.2.3'`, or bare
+`libfoo` for any version. `pkgoci install` solves the whole graph with the
+**PubGrub** algorithm against the versions available in the registry, picks
+the newest satisfying set, and installs it in parallel. Unsatisfiable
+constraints fail with a PubGrub derivation, e.g.:
+
+```
+Because tool depends on libfoo 1.0.0 <= v < 2.0.0 and app 1.0.0 depends on
+libfoo 2.0.0 <= v < 3.0.0, app 1.0.0, tool ∗ are incompatible.
+```
+
+CLI specs accept the same constraints (`pkgoci install 'libfoo@>=1,<1.1'`),
+and `pkgoci uninstall` refuses to remove a package that another installed
+package requires (override with `--force`).
 
 ### Signatures
 
 ```sh
-pkgoci keygen                          # ed25519 keypair in <prefix>/keys
-pkgoci push mytool ... --sign          # signs the package index
-export PKGOCI_VERIFY_KEY=/path/pkgoci.pub
-pkgoci install mytool                  # now fails closed without a valid signature
+pkgoci keygen                          # ed25519 keypair (PEM) in <prefix>/keys
+pkgoci push mytool ... --sign          # cosign-compatible signature
+export PKGOCI_VERIFY_KEY=/path/pkgoci.pub   # a .pub file, or a dir of them
+pkgoci install mytool                  # fails closed without a valid signature
+pkgoci verify mytool                   # explicit check
 ```
 
-Signatures are made over the tag's index digest and stored in the registry as
-an OCI artifact under the cosign-style tag `sha256-<digest>.sig`. When
-`PKGOCI_VERIFY_KEY` is set, every install (dependencies included) must carry a
-signature that verifies against that key.
+Signatures use the sigstore simple-signing payload and cosign's storage
+convention (`sha256-<digest>.sig` tag, `dev.cosignproject.cosign/signature`
+annotation), so they also verify with stock cosign:
+
+```sh
+cosign verify --key pkgoci.pub --insecure-ignore-tlog=true registry-1.docker.io/pkgoci/mytool:1.2.3
+```
+
+When `PKGOCI_VERIFY_KEY` is set (one key or a directory of trusted keys),
+every install — dependencies included — must carry a signature that verifies
+against a trusted key; missing, mismatched, and tampered signatures all abort
+the install. Verification is built in: no external tooling is needed.
 
 ### Publishing
 

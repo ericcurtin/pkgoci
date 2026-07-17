@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::extract;
 use crate::oci;
 use crate::registry::{Client, Resolved};
+use crate::resolve::{self, parse_range, parse_requirement, requirements, Provider};
 use crate::sign;
 
 /// Split `name@version` into (name, tag).
@@ -26,20 +27,6 @@ fn short_name(spec: &str) -> String {
     name.rsplit('/').next().unwrap_or(&name).to_string()
 }
 
-/// Dependencies declared on a resolved artifact.
-fn requires(resolved: &Resolved) -> Vec<String> {
-    resolved
-        .annotation(oci::ANNOTATION_REQUIRES)
-        .map(|r| {
-            r.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------- install
 
 pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
@@ -49,22 +36,52 @@ pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
     let start = Instant::now();
     let client = Client::new(&cfg.registry);
 
-    // Expand the dependency graph breadth-first, deduplicating by package
-    // name. Dependencies are runtime-only, so install order doesn't matter
-    // and the whole plan can proceed in parallel.
-    let mut queue: VecDeque<String> = packages.into();
-    let mut seen = HashSet::new();
+    // Sort requests into version-solver roots (semver constraints, or
+    // unconstrained) and direct tag installs (explicit non-semver tags, or
+    // repositories without semver tags). Direct installs contribute their
+    // requirements to the solver.
+    let probe = Provider::new(cfg, &client, Vec::new());
+    let mut root_deps = Vec::new();
     let mut plan: Vec<(String, Resolved)> = Vec::new();
-    while let Some(spec) = queue.pop_front() {
-        if !seen.insert(short_name(&spec)) {
+    let mut direct_tag = |spec: &str, tag: &str| -> Result<Vec<_>> {
+        let (name, _) = parse_spec(spec);
+        let resolved = client
+            .resolve(&cfg.repo_for(&name), tag)
+            .map_err(|e| anyhow!("{spec}: {e:#}"))?;
+        let mut deps = Vec::new();
+        for req in requirements(&resolved) {
+            let (dep, c) = parse_requirement(&req);
+            deps.push((dep, parse_range(c.as_deref())?));
+        }
+        plan.push((spec.to_string(), resolved));
+        Ok(deps)
+    };
+    for spec in &packages {
+        let (name, constraint) = parse_requirement(spec);
+        match constraint.as_deref() {
+            None if probe.versions_of(&name)?.is_empty() => {
+                root_deps.extend(direct_tag(spec, "latest")?);
+            }
+            c => match parse_range(c) {
+                Ok(range) => root_deps.push((name, range)),
+                // Not a semver constraint: treat it as a literal tag.
+                Err(_) => root_deps.extend(direct_tag(spec, c.unwrap())?),
+            },
+        }
+    }
+
+    // Solve version constraints across the whole dependency graph.
+    let provider = Provider::new(cfg, &client, root_deps);
+    let direct: HashSet<String> = plan.iter().map(|(s, _)| short_name(s)).collect();
+    for (name, version) in resolve::solve(&provider)? {
+        if direct.contains(&short_name(&name)) {
             continue;
         }
-        let (name, tag) = parse_spec(&spec);
-        let resolved = client
-            .resolve(&cfg.repo_for(&name), &tag)
-            .map_err(|e| anyhow!("{spec}: {e:#}"))?;
-        queue.extend(requires(&resolved));
-        plan.push((spec, resolved));
+        let resolved = match provider.take_resolved(&name, &version) {
+            Some(r) => r,
+            None => client.resolve(&cfg.repo_for(&name), &version)?,
+        };
+        plan.push((format!("{name}@{version}"), resolved));
     }
 
     let failures = std::thread::scope(|s| {
@@ -94,27 +111,68 @@ pub fn install(cfg: &Config, packages: Vec<String>, force: bool) -> Result<()> {
 /// is configured. Fails closed: a configured key plus a missing or invalid
 /// signature aborts the install.
 fn verify_signature(cfg: &Config, client: &Client, repo: &str, resolved: &Resolved) -> Result<()> {
-    let Some(pub_path) = cfg.verify_key() else {
+    let Some(trust_root) = cfg.verify_key() else {
         return Ok(());
     };
+    let key = check_signature(client, repo, resolved, &trust_root)?;
+    println!(
+        "Verified {repo} ({}) with {}",
+        resolved.root_digest,
+        key.display()
+    );
+    Ok(())
+}
+
+/// Verify the cosign-format signature artifact for `resolved` against the
+/// keys in `trust_root`. Returns the path of the key that matched.
+fn check_signature(
+    client: &Client,
+    repo: &str,
+    resolved: &Resolved,
+    trust_root: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let trusted = sign::load_trusted_keys(trust_root)?;
     let tag = sign::sig_tag(&resolved.root_digest);
     let sig = client
         .resolve(repo, &tag)
         .map_err(|_| anyhow!("no signature found for {repo} ({})", resolved.root_digest))?;
-    let layer = sig
-        .manifest
-        .layers
-        .first()
-        .ok_or_else(|| anyhow!("malformed signature artifact for {repo}"))?;
-    let tmp = std::env::temp_dir().join(format!(
-        "pkgoci-sig-{}-{}",
-        std::process::id(),
-        &layer.digest.trim_start_matches("sha256:")[..12]
-    ));
-    client.download_blob(repo, &tag, layer, &tmp)?;
-    let payload: sign::SignaturePayload = serde_json::from_slice(&std::fs::read(&tmp)?)?;
-    let _ = std::fs::remove_file(&tmp);
-    sign::verify(&pub_path, &resolved.root_digest, &payload)
+    let mut last_err = anyhow!("signature artifact for {repo} has no signatures");
+    for layer in &sig.manifest.layers {
+        let Some(signature_b64) = layer
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(sign::ANNOTATION_SIGNATURE))
+        else {
+            continue;
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "pkgoci-sig-{}-{}",
+            std::process::id(),
+            &layer.digest.trim_start_matches("sha256:")[..12]
+        ));
+        client.download_blob(repo, &tag, layer, &tmp)?;
+        let payload_bytes = std::fs::read(&tmp)?;
+        let _ = std::fs::remove_file(&tmp);
+
+        // The signed payload must pin the digest we resolved.
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)?;
+        let signed_digest = payload
+            .pointer("/critical/image/docker-manifest-digest")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default();
+        if signed_digest != resolved.root_digest {
+            last_err = anyhow!(
+                "signature is for {signed_digest}, not {}",
+                resolved.root_digest
+            );
+            continue;
+        }
+        match sign::verify(&trusted, &payload_bytes, signature_b64) {
+            Ok(key) => return Ok(key),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 fn install_one(
@@ -196,7 +254,10 @@ fn install_one(
             manifest_digest: resolved.manifest_digest.clone(),
             installed_at: cellar::now_unix(),
             linked: linked.clone(),
-            dependencies: requires(resolved).iter().map(|d| short_name(d)).collect(),
+            dependencies: requirements(resolved)
+                .iter()
+                .map(|d| short_name(d))
+                .collect(),
         },
     )?;
 
@@ -283,7 +344,7 @@ pub fn info(cfg: &Config, package: String) -> Result<()> {
     if let Some(license) = resolved.annotation(oci::ANNOTATION_LICENSES) {
         println!("License: {license}");
     }
-    let deps = requires(&resolved);
+    let deps = requirements(&resolved);
     if !deps.is_empty() {
         println!("Requires: {}", deps.join(", "));
     }
@@ -491,6 +552,10 @@ pub fn push(
         annotations.insert(oci::ANNOTATION_LICENSES.into(), l.clone());
     }
     if !requires.is_empty() {
+        for req in &requires {
+            let (_, constraint) = parse_requirement(req);
+            parse_range(constraint.as_deref()).map_err(|e| anyhow!("--requires {req}: {e}"))?;
+        }
         annotations.insert(oci::ANNOTATION_REQUIRES.into(), requires.join(","));
     }
 
@@ -574,13 +639,19 @@ pub fn push(
     }
 
     if sign_it {
-        let payload = sign::sign(&cfg.signing_key(), &index_digest)?;
-        let payload_json = serde_json::to_string(&payload)?;
-        let payload_digest = format!("sha256:{}", oci::sha256_hex(payload_json.as_bytes()));
+        // Cosign-compatible signature: simple-signing payload as the layer
+        // blob, base64 signature in the cosign annotation, stored under the
+        // sha256-<digest>.sig tag. Verifiable with stock cosign.
+        let image_ref = format!("{}/{repo}", cfg.registry);
+        let payload_bytes = sign::payload(&image_ref, &index_digest);
+        let signature_b64 = sign::sign(&cfg.signing_key(), &payload_bytes)?;
+        let payload_digest = format!("sha256:{}", oci::sha256_hex(&payload_bytes));
         let payload_path = tmp.join("sig.json");
-        std::fs::write(&payload_path, &payload_json)?;
+        std::fs::write(&payload_path, &payload_bytes)?;
         client.push_blob(&repo, &version, &payload_digest, &payload_path)?;
 
+        let mut sig_annotations = oci::Annotations::new();
+        sig_annotations.insert(sign::ANNOTATION_SIGNATURE.into(), signature_b64);
         let sig_manifest = oci::Manifest {
             schema_version: 2,
             media_type: Some(oci::MT_OCI_MANIFEST.into()),
@@ -592,11 +663,11 @@ pub fn push(
                 annotations: None,
             },
             layers: vec![oci::Descriptor {
-                media_type: oci::MT_PKGOCI_SIG.into(),
+                media_type: sign::MT_SIMPLE_SIGNING.into(),
                 digest: payload_digest,
-                size: payload_json.len() as u64,
+                size: payload_bytes.len() as u64,
                 platform: None,
-                annotations: None,
+                annotations: Some(sig_annotations),
             }],
             annotations: None,
         };
@@ -614,6 +685,27 @@ pub fn push(
         "Pushed {}/{repo}:{version} ({} platform(s))",
         cfg.registry,
         index.manifests.len()
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------- verify
+
+/// Verify a package's signature explicitly (like `brew verify`).
+pub fn verify(cfg: &Config, package: String, key: Option<std::path::PathBuf>) -> Result<()> {
+    let trust_root = key
+        .or_else(|| cfg.verify_key())
+        .ok_or_else(|| anyhow!("no key given (use --key or set PKGOCI_VERIFY_KEY)"))?;
+    let (name, tag) = parse_spec(&package);
+    let repo = cfg.repo_for(&name);
+    let client = Client::new(&cfg.registry);
+    let resolved = client.resolve(&repo, &tag)?;
+    let matched = check_signature(&client, &repo, &resolved, &trust_root)?;
+    println!(
+        "OK: {}/{repo}:{tag} ({}) verified with {}",
+        cfg.registry,
+        resolved.root_digest,
+        matched.display()
     );
     Ok(())
 }
