@@ -93,6 +93,12 @@ enum Cmd {
 }
 
 fn main() {
+    // Die quietly on closed pipes (`pkgoci ... | head`) instead of
+    // panicking: restore the default SIGPIPE disposition Rust masks.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);

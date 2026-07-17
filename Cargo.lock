@@ -594,6 +594,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "hex",
+ "libc",
  "pubgrub",
  "rand",
  "ruzstd",
