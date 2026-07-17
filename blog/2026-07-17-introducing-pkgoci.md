@@ -7,9 +7,9 @@ experiment with a big premise: **what if a package manager didn't need any
 package infrastructure at all?**
 
 No formula repository. No package index to sync. No custom CDN, no custom
-metadata service, no custom protocol — not even for dependency resolution or
-signatures. Just OCI registries — the same infrastructure that already serves
-billions of container image pulls a day — holding ordinary, spec-compliant
+metadata service, no custom protocol, not even for dependency resolution or
+signatures. Just OCI registries, the same infrastructure that already serves
+billions of container image pulls a day, holding ordinary, spec-compliant
 artifacts that any OCI tool can inspect.
 
 ```sh
@@ -39,21 +39,21 @@ Linux.
 pkgoci goes the rest of the way:
 
 - **Artifacts are plain OCI.** An image index with one manifest per platform,
-  selected via the standard `platform.os`/`platform.architecture` fields —
+  selected via the standard `platform.os`/`platform.architecture` fields:
   the exact mechanism `docker pull` uses to pick `linux/arm64` vs
   `linux/amd64`. Metadata lives in standard `org.opencontainers.image.*`
   annotations. Versions are tags.
 - **Because platform selection is standard, platforms are free.** pkgoci
   ships native packages for **macOS aarch64, Linux x86_64/aarch64, and
-  Windows x86_64/aarch64** — including the Windows targets Homebrew has never
+  Windows x86_64/aarch64**, including the Windows targets Homebrew has never
   supported. All five are built and tested in CI, natively, on every commit.
-- **Docker Hub is the default registry**, not ghcr — but it's one environment
+- **Docker Hub is the default registry**, not ghcr, but it's one environment
   variable to point at any OCI registry, including a `registry:2` container
   on localhost for hacking.
 
 ## Real version solving, without a solver service
 
-Packages declare semver-constrained requirements — one line in the
+Packages declare semver-constrained requirements: one line in the
 `Pkgocifile`, one more standard annotation on the artifact:
 
 ```text
@@ -79,7 +79,7 @@ graph lives on the artifacts themselves.
 
 ## It builds from source, too
 
-A `Pkgocifile` doesn't have to pack prebuilt trees — it can build them. This
+A `Pkgocifile` doesn't have to pack prebuilt trees; it can build them. This
 is the real recipe for upstream Lua, from the repo's `examples/`:
 
 ```text
@@ -98,12 +98,12 @@ OUTPUT ./out
 ```
 
 `FETCH` pulls the sha256-pinned upstream tarball (the digest also lands in
-the build provenance), `RUN` steps execute in a scratch copy of the context —
-never mutating it, like a Docker build — and `pkgoci build` packs `OUTPUT`
+the build provenance), `RUN` steps execute in a scratch copy of the context
+(never mutating it, like a Docker build), and `pkgoci build` packs `OUTPUT`
 for the host platform. `TEST` steps (Homebrew's `test do`, in one line each)
 gate the build, `ENV` sets build variables, `FROM` picks the Linux build
 image exactly like a Dockerfile, and long lines continue with a backslash.
-And — this is the interesting part — `SOURCE` publishes the post-fetch source
+And here is the interesting part: `SOURCE` publishes the post-fetch source
 tree *and its build recipe* as one more platform entry in the same artifact
 (`source/all`, next to `darwin/arm64` and friends), so `TEST` and `ENV`
 travel with the source and gate install-time rebuilds too.
@@ -121,12 +121,12 @@ before a single build step runs**.
 A build recipe is arbitrary code, so `RUN` steps never execute directly on
 your machine. Each OS uses its native isolation:
 
-- **Linux**: Docker — the work tree is the only mount, the container runs as
+- **Linux**: Docker. The work tree is the only mount, the container runs as
   your uid with `--network=none`, and the build environment is an image you
   pick with `FROM` (default `buildpack-deps:bookworm`), exactly like a
   Dockerfile.
-- **macOS**: seatbelt (`sandbox-exec`) — the same mechanism Homebrew's build
-  sandbox uses — with writes confined to the work tree and temp dirs and the
+- **macOS**: seatbelt (`sandbox-exec`), the same mechanism Homebrew's build
+  sandbox uses, with writes confined to the work tree and temp dirs and the
   network denied.
 - **Windows**: a SAFER *constrained* restricted token; the work tree is the
   only location ACLed for the RESTRICTED SID.
@@ -139,9 +139,9 @@ network at all.
 
 ### Is the format enough for real software?
 
-To find out, I took two packages from each of three ecosystems — **xz** and
+To find out, I took two packages from each of three ecosystems (**xz** and
 **sqlite** from Fedora, **jq** and **lua** from Homebrew, **ninja** and
-**zstd** from winget — and packaged all six from their upstream release
+**zstd** from winget) and packaged all six from their upstream release
 tarballs with nothing but a Pkgocifile each. Every one builds, signs,
 attests, pushes, installs, and runs, on macOS and in CI on Linux (including
 rebuilding Lua from its *published* source layer):
@@ -155,14 +155,14 @@ Lua 5.4.8  Copyright (C) 1994-2025 Lua.org, PUC-Rio
 1.13.1
 ```
 
-Getting there required exactly two additions to the format — `FETCH` (pinned
+Getting there required exactly two additions to the format, `FETCH` (pinned
 upstream sources) and `RUN:<os>` (Lua's `make macosx`/`make linux`/`make
-mingw` build targets) — which is the point of testing against real software
+mingw` build targets), which is the point of testing against real software
 instead of hello-world.
 
 ## Signatures and build provenance, cosign-verifiable
 
-Signing follows the same rule — no new infrastructure, and no new formats.
+Signing follows the same rule: no new infrastructure, and no new formats.
 pkgoci signs the sigstore *simple signing* payload with an ed25519 key and
 stores it in the registry, next to the package, using cosign's storage
 convention (the `sha256-<digest>.sig` tag and
@@ -172,12 +172,12 @@ And because `pkgoci build` is the thing that builds the package, it records
 **SLSA v1 build provenance** while doing so: an in-toto statement pinning the
 Pkgocifile digest, the source digest, the exact build steps, the builder, and
 timestamps. `push --sign` publishes that provenance as a DSSE attestation
-under cosign's `sha256-<digest>.att` tag — the same shape as the build
+under cosign's `sha256-<digest>.att` tag, the same shape as the build
 attestations Homebrew attaches to its bottles.
 
 And signatures don't have to stay private: `--rekor` records them in the
-**Rekor transparency log** — the same public, append-only log that backs
-sigstore and Homebrew's attestations — and stores the log's receipt (the
+**Rekor transparency log**, the same public, append-only log that backs
+sigstore and Homebrew's attestations, and stores the log's receipt (the
 Signed Entry Timestamp) alongside the signature, where `pkgoci verify`
 checks it against the log's key and confirms it binds this exact signature
 and payload.
@@ -212,7 +212,7 @@ $ cosign verify-attestation --key pkgoci.pub --type slsaprovenance1 \
 
 With `PKGOCI_VERIFY_KEY` set (a key, or a directory of trusted keys),
 installs **fail closed**: a missing signature, a signature from an untrusted
-key, or a tampered artifact aborts the install — for every dependency in the
+key, or a tampered artifact aborts the install, for every dependency in the
 plan, not just the package you asked for, and before any source build step
 executes. The digest chain does the rest: the signature covers the index, the
 index pins the manifests, the manifests pin the blobs, and the provenance
@@ -224,7 +224,7 @@ verification is built in, works for any publisher on any registry, covers
 signatures, provenance, *and* the transparency log receipt, and enforces the
 entire dependency graph.
 
-## It's fast — measurably faster than Homebrew on everything
+## It's fast: measurably faster than Homebrew on everything
 
 A package manager is a CLI you run interactively, so latency is the product.
 Two design decisions do most of the work here:
@@ -248,14 +248,14 @@ in the repo):
 | `info` (network)      | 1.048 s  | 1.227 s  | **1.2x**|
 | `search` (network)    | 385 ms   | 1.134 s  | **2.9x**|
 
-The network-bound commands converge toward network latency, as they should —
+The network-bound commands converge toward network latency, as they should,
 but the local commands you run dozens of times a day are one to two orders of
 magnitude faster.
 
 ## Publishing works like Docker: build, then push
 
 There's no formula to write and no PR to send. You describe the package once
-in a `Pkgocifile` — deliberately reminiscent of a Dockerfile — and then it's
+in a `Pkgocifile`, deliberately reminiscent of a Dockerfile, and then it's
 the two verbs every container user already knows:
 
 ```text
@@ -279,7 +279,7 @@ pkgoci push mytool --sign # like docker push: local store -> registry
 
 `build` runs any `RUN` steps, packs each platform tree into a layer, records
 the build provenance, and writes a standard **OCI image layout** into the
-local store — every blob content-addressed, so the digest `build` prints is
+local store. Every blob is content-addressed, so the digest `build` prints is
 exactly the digest `push` tags, signs, and attests. `push` uploads it to any
 registry you have credentials for, as an image index tagged `1.2.3` and
 `latest`, plus the cosign-format signature and provenance attestation. Your
@@ -296,7 +296,7 @@ This is a young project, and I'd rather list its gaps than oversell it:
   *infrastructure*, not for *packages*. The default `pkgoci` namespace on
   Docker Hub needs to be populated before `pkgoci install jq` means anything.
 - **A sandbox is a boundary, not a review.** Builds can't touch your files or
-  the network, but you're still running and installing the publisher's code —
+  the network, but you're still running and installing the publisher's code;
   signatures and provenance tell you *who* you're trusting, not that it's
   safe. And a `RUN make` is not a formula DSL: casks, services, and the rest
   of Homebrew's two decades of ecosystem are not what this replaces.
