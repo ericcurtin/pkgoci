@@ -1,0 +1,69 @@
+# kubernetes — Fedora 44 packages the whole control plane from one source
+# tree as four RPMs (kubernetes, kubernetes-client, kubernetes-kubeadm,
+# kubernetes-systemd) that must always share one version. That is exactly
+# what a multi-package Pkgocifile is for: one shared FETCH/RUN/TEST, several
+# NAMEs each packing their own OUTPUT, always in lockstep because they can
+# only ever be built and versioned together.
+#
+# pkgoci has no service manager (no systemd units, no /etc), so unlike
+# Fedora's RPMs this only installs the binaries; wiring up kubelet,
+# kube-apiserver, etc. as system services is left to the host, same as it
+# would be for a binary you `go install`ed by hand.
+NAME kubernetes
+VERSION 1.36.2
+DESCRIPTION Kubernetes agent (kubelet) that runs on every node in a cluster
+LICENSE Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSD-3-Clause-HP AND CC-BY-4.0 AND ISC AND MIT AND MPL-2.0
+URL https://kubernetes.io
+REQUIRES kubernetes-cni@^1.9
+OUTPUT ./out-kubelet
+
+NAME kubernetes-client
+DESCRIPTION kubectl, the Kubernetes command-line client
+LICENSE Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSD-3-Clause-HP AND CC-BY-4.0 AND ISC AND MIT AND MPL-2.0
+URL https://kubernetes.io
+OUTPUT ./out-client
+
+NAME kubernetes-kubeadm
+DESCRIPTION kubeadm, a tool for standing up Kubernetes clusters
+LICENSE Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSD-3-Clause-HP AND CC-BY-4.0 AND ISC AND MIT AND MPL-2.0
+URL https://kubernetes.io
+REQUIRES kubernetes-cni@^1.9
+REQUIRES kubernetes
+OUTPUT ./out-kubeadm
+
+NAME kubernetes-systemd
+DESCRIPTION Control plane binaries (kube-apiserver, kube-controller-manager, kube-scheduler, kube-proxy)
+LICENSE Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSD-3-Clause-HP AND CC-BY-4.0 AND ISC AND MIT AND MPL-2.0
+URL https://kubernetes.io
+REQUIRES kubernetes
+OUTPUT ./out-systemd
+
+FETCH https://src.fedoraproject.org/lookaside/pkgs/kubernetes1.36/kubernetes-${PKGOCI_VERSION}.tar.gz/sha512/6d02dcb4c57b3f2ef5f2307c77b30dfe66168646d0d827bac7b56348183e5fa85261f2c859dab257f50e0d18b5d0f9a4aabce323c63041aa7f8660af1926129c/kubernetes-${PKGOCI_VERSION}.tar.gz ffbc46612cf32ad08a3b606de064b63afc350ae1dd1a691e99b5cd127d716c26
+# go.work-based projects don't commit vendor/, so Fedora publishes it as a
+# separate archive with no wrapping directory; FETCH extracts each archive
+# on its own detected layout, so both merge cleanly into one context.
+FETCH https://src.fedoraproject.org/lookaside/pkgs/kubernetes1.36/kubernetes-${PKGOCI_VERSION}-vendor.tar.bz2/sha512/2c116f0331cca390239ac4813f098403cf9fea7e537d3dbc29c1c218f503e5161ba96c3d0d6e3c15ec1f9a19e0d5dd1a970057349c03c5198b7138514c7ae526/kubernetes-${PKGOCI_VERSION}-vendor.tar.bz2 5fda68242585e0f8818231a3e27f6dcb28b6daf09faeb4129bf7c7a83f1f4a58
+FROM docker.io/library/golang:1.26-bookworm
+ENV GOFLAGS=-mod=vendor
+# $PKGOCI_VERSION is set by pkgoci for every RUN/TEST step; each RUN below
+# expands it directly rather than through another ENV, since env values
+# are stored literally and are not re-expanded by the shell.
+RUN mkdir -p out-kubelet/bin out-client/bin out-kubeadm/bin out-systemd/bin
+RUN go build -ldflags "-s -w -X k8s.io/client-go/pkg/version.gitVersion=v$PKGOCI_VERSION -X k8s.io/component-base/version.gitVersion=v$PKGOCI_VERSION" \
+    -o out-kubelet/bin/kubelet ./cmd/kubelet
+RUN go build -ldflags "-s -w -X k8s.io/client-go/pkg/version.gitVersion=v$PKGOCI_VERSION -X k8s.io/component-base/version.gitVersion=v$PKGOCI_VERSION" \
+    -o out-client/bin/kubectl ./cmd/kubectl
+RUN go build -ldflags "-s -w -X k8s.io/client-go/pkg/version.gitVersion=v$PKGOCI_VERSION -X k8s.io/component-base/version.gitVersion=v$PKGOCI_VERSION" \
+    -o out-kubeadm/bin/kubeadm ./cmd/kubeadm
+RUN go build -ldflags "-s -w -X k8s.io/client-go/pkg/version.gitVersion=v$PKGOCI_VERSION -X k8s.io/component-base/version.gitVersion=v$PKGOCI_VERSION" \
+    -o out-systemd/bin/kube-apiserver ./cmd/kube-apiserver
+RUN go build -ldflags "-s -w -X k8s.io/client-go/pkg/version.gitVersion=v$PKGOCI_VERSION -X k8s.io/component-base/version.gitVersion=v$PKGOCI_VERSION" \
+    -o out-systemd/bin/kube-controller-manager ./cmd/kube-controller-manager
+RUN go build -ldflags "-s -w -X k8s.io/client-go/pkg/version.gitVersion=v$PKGOCI_VERSION -X k8s.io/component-base/version.gitVersion=v$PKGOCI_VERSION" \
+    -o out-systemd/bin/kube-scheduler ./cmd/kube-scheduler
+RUN go build -ldflags "-s -w -X k8s.io/client-go/pkg/version.gitVersion=v$PKGOCI_VERSION -X k8s.io/component-base/version.gitVersion=v$PKGOCI_VERSION" \
+    -o out-systemd/bin/kube-proxy ./cmd/kube-proxy
+TEST ./out-kubelet/bin/kubelet --version 2>&1 | grep -q "Kubernetes v$PKGOCI_VERSION"
+TEST ./out-client/bin/kubectl version --client 2>&1 | grep -q "Client Version: v$PKGOCI_VERSION"
+TEST ./out-kubeadm/bin/kubeadm version 2>&1 | grep -q "v$PKGOCI_VERSION"
+TEST ./out-systemd/bin/kube-apiserver --version 2>&1 | grep -q "Kubernetes v$PKGOCI_VERSION"

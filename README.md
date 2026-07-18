@@ -53,7 +53,11 @@ Add `$(pkgoci prefix)/bin` to your `PATH`.
 Packages declare runtime dependencies with semver constraints (`REQUIRES` in
 the `Pkgocifile`, a `dev.pkgoci.requires` annotation on the artifact):
 `libfoo@^1.2`, `libfoo@>=1,<3`, `libfoo@~1.2.3`, exact `libfoo@1.2.3`, or
-bare `libfoo` for any version. `pkgoci install` solves the whole graph with the
+bare `libfoo` for any version. A bare `REQUIRES` on another package defined
+in the *same* Pkgocifile (see "One source, several packages" below) is
+special: it's automatically pinned to that shared version, so a family like
+`kubernetes-kubeadm REQUIRES kubernetes` never drifts across rebuilds.
+`pkgoci install` solves the whole graph with the
 **PubGrub** algorithm against the versions available in the registry, picks
 the newest satisfying set, and installs it in parallel. Unsatisfiable
 constraints fail with a PubGrub derivation, e.g.:
@@ -94,24 +98,61 @@ source tree and its build recipe are published as part of the package, so
 `pkgoci install` transparently builds from source on platforms without
 prebuilt binaries — and `pkgoci install -s/--build-from-source` forces it.
 Signature verification happens before any build step runs, and `FETCH`
-digests are recorded in the build provenance.
+digests are recorded in the build provenance. `FETCH` archives can be
+`.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.zst`/`.tzst`, or bare `.tar`; the
+leading path component is stripped only when every entry in the archive
+shares one, so both a GitHub release tarball (one wrapping directory) and a
+vendored dependency tree (none) just work with no extra syntax.
+
+### One source, several packages
+
+Real software often isn't one binary: Fedora's `kubernetes` spec builds four
+RPMs (`kubernetes`, `-client`, `-kubeadm`, `-systemd`) from one source tree
+that must always share a version. Repeating `NAME` does the same in a
+Pkgocifile: `VERSION`, `FETCH`, `SOURCE`, `FROM`, `ENV`, `RUN`, and `TEST` are
+shared and run once, while `DESCRIPTION`, `LICENSE`, `URL`, `REQUIRES`,
+`PLATFORM`, and `OUTPUT` apply to whichever `NAME` came before them:
+
+```dockerfile
+NAME kubernetes
+VERSION 1.36.2
+DESCRIPTION Kubernetes agent (kubelet) that runs on every node in a cluster
+REQUIRES kubernetes-cni@^1.9
+OUTPUT ./out-kubelet
+
+NAME kubernetes-client
+DESCRIPTION kubectl, the Kubernetes command-line client
+OUTPUT ./out-client
+
+FETCH https://.../kubernetes-${PKGOCI_VERSION}.tar.gz <sha256>
+FETCH https://.../kubernetes-${PKGOCI_VERSION}-vendor.tar.bz2 <sha256>
+RUN go build -o out-kubelet/bin/kubelet ./cmd/kubelet
+RUN go build -o out-client/bin/kubectl ./cmd/kubectl
+TEST ./out-client/bin/kubectl version --client
+```
+
+`pkgoci build` runs the shared fetch/RUN/TEST once and packs each `NAME` into
+its own image, so `pkgoci push kubernetes-client` and
+`pkgoci push kubernetes` are two independently installable artifacts built
+together and always in version lockstep (see the full recipe, all four
+packages, in `examples/kubernetes/Pkgocifile`).
 
 ### Pkgocifile reference
 
 | Directive | Meaning |
 |-----------|---------|
-| `NAME <name>` | Package name (required) |
-| `VERSION <semver>` | Package version (required) |
-| `DESCRIPTION <text>` / `LICENSE <spdx>` / `URL <url>` | Metadata annotations |
-| `REQUIRES <name[@constraint]>` | Runtime dependency (repeatable; `^`, `~`, ranges, pins) |
-| `PLATFORM <os/arch> <dir>` | Prebuilt tree for a platform (repeatable) |
-| `FETCH <url> <sha256>` | Digest-pinned upstream tarball, extracted into the context (`${PKGOCI_VERSION}` substituted) |
+| `NAME <name>` | Start a package (required, repeatable — see above) |
+| `VERSION <semver>` | Shared version for every package in the file (required, once) |
+| `DESCRIPTION <text>` / `LICENSE <spdx>` / `URL <url>` | Metadata annotations (scoped to the current `NAME`) |
+| `REQUIRES <name[@constraint]>` | Runtime dependency (repeatable, scoped to the current `NAME`; `^`, `~`, ranges, pins) |
+| `PLATFORM <os/arch> <dir>` | Prebuilt tree for a platform (repeatable, scoped to the current `NAME`) |
+| `FETCH <url> <sha256>` | Digest-pinned upstream archive, extracted into the (shared) context (`${PKGOCI_VERSION}` substituted) |
 | `SOURCE [dir]` | Publish the (post-fetch) source tree, default `.` |
 | `FROM <image>` | Build image for the Linux Docker sandbox |
 | `ENV <KEY>=<VALUE>` | Environment for RUN/TEST steps (published with the recipe) |
-| `RUN [ :os ] <cmd>` | Sandboxed build step; `$PKGOCI_NAME/VERSION/OS/ARCH` set |
+| `RUN [ :os ] <cmd>` | Sandboxed build step, shared by every package; `$PKGOCI_NAME/VERSION/OS/ARCH` set |
 | `TEST [ :os ] <cmd>` | Sandboxed post-build check (also run after install-time rebuilds) |
-| `OUTPUT <dir>` | Tree produced by RUN, packed for the host (default `./out`) |
+| `OUTPUT <dir>` | Tree produced by RUN, packed for the host (scoped to the current `NAME`, default `./out`; each package needs its own when a file has several) |
 
 Lines may continue with a trailing backslash; `#` starts a comment.
 
@@ -130,7 +171,14 @@ This applies both to `pkgoci build` and to install-time source builds.
 
 `examples/` packages real software from three ecosystems with this format:
 xz and sqlite (Fedora), jq and lua (Homebrew), ninja and zstd (winget) — all
-built, installed, and run in CI.
+built, installed, and run in CI. `examples/kubernetes` is a heavier stress
+test of the same format: Fedora 44's `kubernetes` spec (kubelet, kubectl,
+kubeadm, and the rest of the control plane) built from its real upstream
+source and `go-vendor-tools` vendor tree as four packages sharing one
+Pkgocifile, plus its `kubernetes-cni` runtime dependency
+(`examples/kubernetes-cni`) as a fifth, separately built and versioned
+package — exercising multi-package builds, cross-package `REQUIRES`, and
+`FETCH` of a non-gzip, non-wrapped archive all at once.
 
 ### Signatures
 

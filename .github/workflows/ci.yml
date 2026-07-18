@@ -159,6 +159,35 @@ jobs:
           if PKGOCI_VERIFY_KEY=/tmp/otherkeys/pkgoci.pub $B install hello --force; then echo "wrong-key install must fail"; exit 1; fi
           # Pushing an unbuilt package fails helpfully.
           if $B push nothere; then echo "push of unbuilt package must fail"; exit 1; fi
+          # One Pkgocifile, several packages: NAME repeats to share one
+          # FETCH/RUN/TEST across packages that must stay in version
+          # lockstep (see examples/kubernetes for the real-world version).
+          mkdir -p /tmp/multi/src
+          printf '#include <stdio.h>\nint main(void){puts("tool-a");return 0;}\n' > /tmp/multi/src/a.c
+          printf '#include <stdio.h>\nint main(void){puts("tool-b");return 0;}\n' > /tmp/multi/src/b.c
+          cat > /tmp/multi/Pkgocifile <<'PKGEOF'
+          NAME multitool
+          VERSION 1.0.0
+          REQUIRES libfoo@^1
+          RUN mkdir -p out/bin out-b/bin && cc src/a.c -o out/bin/tool-a && cc src/b.c -o out-b/bin/tool-b
+          TEST ./out/bin/tool-a
+          OUTPUT ./out
+
+          NAME multitool-extra
+          REQUIRES multitool
+          OUTPUT ./out-b
+          PKGEOF
+          $B build /tmp/multi
+          $B push multitool --sign
+          $B push multitool-extra --sign
+          $B install multitool-extra
+          "$RUNNER_TEMP/prefix/bin/tool-a"
+          "$RUNNER_TEMP/prefix/bin/tool-b"
+          # A bare REQUIRES on a sibling package in the same file is
+          # auto-pinned to the shared version, not left unconstrained.
+          $B info multitool-extra | grep "Requires: multitool@1.0.0"
+          $B uninstall multitool 2>&1 | grep "required by multitool-extra"
+          $B uninstall multitool-extra multitool
           # Build-from-source: SOURCE + RUN compile at build time, the source
           # ships with the package, and installs can rebuild it.
           mkdir -p /tmp/src/src
@@ -231,6 +260,39 @@ jobs:
           # Rebuild one from its published source layer (RUN:linux path).
           $B install lua --force --build-from-source
           "$RUNNER_TEMP/prefix/bin/lua" -v
+      - name: Kubernetes (Fedora 44 spec, multi-package + a real dependency)
+        if: matrix.platform == 'linux/amd64'
+        shell: bash
+        run: |
+          export PKGOCI_REGISTRY=localhost:5001 PKGOCI_NAMESPACE=ci PKGOCI_PREFIX="$RUNNER_TEMP/prefix"
+          export PKGOCI_VERIFY_KEY="$RUNNER_TEMP/prefix/keys/pkgoci.pub"
+          B=./${{ matrix.bin }}
+          # examples/kubernetes-cni: kubelet's real `kubernetes-cni` runtime
+          # dependency, built and versioned separately.
+          $B build examples/kubernetes-cni
+          $B push kubernetes-cni --sign
+          # examples/kubernetes: Fedora 44's kubernetes.spec (kubelet,
+          # kubectl, kubeadm, kube-apiserver/controller-manager/scheduler/
+          # proxy) built from its real upstream source and go-vendor-tools
+          # vendor tree as four packages sharing one Pkgocifile and one
+          # build, exactly like the four RPMs Fedora builds from one spec.
+          $B build examples/kubernetes
+          for pkg in kubernetes kubernetes-client kubernetes-kubeadm kubernetes-systemd; do
+            $B push "$pkg" --sign
+          done
+          $B install kubernetes-client kubernetes-kubeadm kubernetes-systemd
+          "$RUNNER_TEMP/prefix/bin/kubectl" version --client | grep "Client Version: v1.36.2"
+          "$RUNNER_TEMP/prefix/bin/kubeadm" version | grep "v1.36.2"
+          "$RUNNER_TEMP/prefix/bin/kubelet" --version | grep "Kubernetes v1.36.2"
+          "$RUNNER_TEMP/prefix/bin/kube-apiserver" --version | grep "Kubernetes v1.36.2"
+          # kubernetes-kubeadm and kubernetes-systemd both bare-REQUIRES
+          # kubernetes, auto-pinned to the exact version they were built
+          # with, and kubernetes/kubernetes-kubeadm both need kubernetes-cni.
+          $B info kubernetes-kubeadm | grep "Requires: kubernetes-cni@^1.9, kubernetes@1.36.2"
+          $B info kubernetes-systemd | grep "Requires: kubernetes@1.36.2"
+          $B list | grep "kubernetes-cni 1.9.1"
+          $B uninstall kubernetes-cni 2>&1 | grep "required by"
+          $B verify kubernetes-cni | grep "build provenance"
       - uses: actions/upload-artifact@v4
         with:
           name: pkgoci-${{ matrix.artifact }}

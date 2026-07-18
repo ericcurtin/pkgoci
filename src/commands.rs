@@ -622,8 +622,9 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
 
 // ------------------------------------------------------------------- build
 
-/// Build a package described by a Pkgocifile into the local store as a
-/// standard OCI image layout (like `docker build`).
+/// Build the package(s) described by a Pkgocifile into the local store as
+/// standard OCI image layouts (like `docker build`). A file with several
+/// `NAME`s shares one fetch/RUN/TEST but packs each package separately.
 pub fn build(
     cfg: &Config,
     path: std::path::PathBuf,
@@ -636,6 +637,7 @@ pub fn build(
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
+    let root_name = spec.primary().name.clone();
 
     // The context stays read-only (like docker build): fetching and building
     // happen in a scratch copy.
@@ -644,7 +646,7 @@ pub fn build(
     } else {
         let staging = cfg
             .cache()
-            .join(format!("build-{}-{}", spec.name, spec.version));
+            .join(format!("build-{root_name}-{}", spec.version));
         if staging.exists() {
             std::fs::remove_dir_all(&staging)?;
         }
@@ -654,26 +656,27 @@ pub fn build(
 
     // Fetch digest-pinned upstream sources into the work tree.
     for (url, sha) in &spec.fetches {
-        fetch_source(cfg, url, sha, &spec, &work)?;
+        fetch_source(cfg, url, sha, &root_name, &spec.version, &work)?;
     }
 
     // Pack the (pristine, post-fetch, pre-build) source tree now so the
-    // published source layer never contains build artifacts.
+    // published source layer never contains build artifacts. Shared by
+    // every package in the file.
     let source_bytes = spec
         .source
         .as_ref()
         .map(|rel| extract::pack_dir(&work.join(rel)))
         .transpose()?;
 
-    // Execute RUN steps sandboxed and pack their OUTPUT for the host
-    // platform (like docker build's RUN), then run TEST checks.
+    // Execute RUN steps sandboxed (like docker build's RUN), then run TEST
+    // checks, once for the whole file.
     if !spec.run.is_empty() {
         println!("Sandbox: {}", crate::sandbox::describe(&spec.image));
         run_steps(
             &spec.run,
             "RUN",
             &work,
-            &spec.name,
+            &root_name,
             &spec.version,
             &spec.image,
             &spec.env,
@@ -682,27 +685,51 @@ pub fn build(
             &spec.tests,
             "TEST",
             &work,
-            &spec.name,
+            &root_name,
             &spec.version,
             &spec.image,
             &spec.env,
         )?;
-        let output = work.join(&spec.output);
-        if !output.is_dir() {
-            bail!(
-                "RUN steps did not produce OUTPUT directory {}",
-                output.display()
-            );
-        }
         let (os, arch) = (
             crate::platform::os().to_string(),
             crate::platform::arch().to_string(),
         );
-        spec.platforms.retain(|(o, a, _)| (o, a) != (&os, &arch));
-        spec.platforms.push((os, arch, output));
+        for pkg in &mut spec.packages {
+            let output = work.join(&pkg.output);
+            if !output.is_dir() {
+                bail!(
+                    "RUN steps did not produce OUTPUT directory {} for {}",
+                    output.display(),
+                    pkg.name
+                );
+            }
+            pkg.platforms.retain(|(o, a, _)| (o, a) != (&os, &arch));
+            pkg.platforms.push((os.clone(), arch.clone(), output));
+        }
     }
 
-    let out = cfg.store().join(&spec.name).join(&spec.version);
+    let pkgocifile_bytes = std::fs::read(&pkgocifile)?;
+    for pkg in &spec.packages {
+        pack_package(cfg, &spec, pkg, &source_bytes, &started, &pkgocifile_bytes)?;
+    }
+    if work != context {
+        let _ = std::fs::remove_dir_all(&work);
+    }
+    Ok(())
+}
+
+/// Pack one package's platforms (and shared source, if any) into an OCI
+/// image layout under `<store>/<pkg.name>/<version>`, with SLSA build
+/// provenance for `push --sign` to attest.
+fn pack_package(
+    cfg: &Config,
+    spec: &crate::pkgocifile::Spec,
+    pkg: &crate::pkgocifile::Package,
+    source_bytes: &Option<Vec<u8>>,
+    started: &str,
+    pkgocifile_bytes: &[u8],
+) -> Result<()> {
+    let out = cfg.store().join(&pkg.name).join(&spec.version);
     if out.exists() {
         std::fs::remove_dir_all(&out)?;
     }
@@ -712,28 +739,32 @@ pub fn build(
 
     let mut annotations = oci::Annotations::new();
     annotations.insert(oci::ANNOTATION_VERSION.into(), spec.version.clone());
-    if let Some(d) = &spec.description {
+    if let Some(d) = &pkg.description {
         annotations.insert(oci::ANNOTATION_DESCRIPTION.into(), d.clone());
     }
-    if let Some(l) = &spec.license {
+    if let Some(l) = &pkg.license {
         annotations.insert(oci::ANNOTATION_LICENSES.into(), l.clone());
     }
-    if let Some(u) = &spec.url {
+    if let Some(u) = &pkg.url {
         annotations.insert(oci::ANNOTATION_URL.into(), u.clone());
     }
-    if !spec.requires.is_empty() {
-        annotations.insert(oci::ANNOTATION_REQUIRES.into(), spec.requires.join(","));
+    if !pkg.requires.is_empty() {
+        annotations.insert(oci::ANNOTATION_REQUIRES.into(), pkg.requires.join(","));
     }
 
     // Shared empty config blob.
     let config_digest = write_blob(&blobs, b"{}")?;
 
     let mut manifests = Vec::new();
-    for (os, arch, dir) in &spec.platforms {
+    for (os, arch, dir) in &pkg.platforms {
         let layer_bytes = extract::pack_dir(dir)?;
         let layer_size = layer_bytes.len() as u64;
         let layer_digest = write_blob(&blobs, &layer_bytes)?;
-        println!("Packed {os}/{arch} ({})", cellar::human_bytes(layer_size));
+        println!(
+            "Packed {} {os}/{arch} ({})",
+            pkg.name,
+            cellar::human_bytes(layer_size)
+        );
 
         let manifest = oci::Manifest {
             schema_version: 2,
@@ -775,16 +806,20 @@ pub fn build(
     let mut source_digest_hex = None;
     if let Some(src_bytes) = source_bytes {
         let src_size = src_bytes.len() as u64;
-        let src_digest = write_blob(&blobs, &src_bytes)?;
+        let src_digest = write_blob(&blobs, src_bytes)?;
         source_digest_hex = Some(src_digest.trim_start_matches("sha256:").to_string());
-        println!("Packed source ({})", cellar::human_bytes(src_size));
+        println!(
+            "Packed {} source ({})",
+            pkg.name,
+            cellar::human_bytes(src_size)
+        );
 
         let mut src_annotations = annotations.clone();
         src_annotations.insert(
             oci::ANNOTATION_BUILD.into(),
             serde_json::to_string(&spec.run)?,
         );
-        src_annotations.insert(oci::ANNOTATION_OUTPUT.into(), spec.output.clone());
+        src_annotations.insert(oci::ANNOTATION_OUTPUT.into(), pkg.output.clone());
         src_annotations.insert(oci::ANNOTATION_IMAGE.into(), spec.image.clone());
         if !spec.tests.is_empty() {
             src_annotations.insert(
@@ -860,24 +895,23 @@ pub fn build(
 
     // SLSA v1 build provenance for the package, signed and pushed as a DSSE
     // attestation by `pkgoci push --sign`.
-    let pkgocifile_bytes = std::fs::read(&pkgocifile)?;
     let mut materials = vec![serde_json::json!({
         "name": crate::pkgocifile::FILE_NAME,
-        "digest": {"sha256": oci::sha256_hex(&pkgocifile_bytes)}
+        "digest": {"sha256": oci::sha256_hex(pkgocifile_bytes)}
     })];
     if let Some(hex) = source_digest_hex {
         materials.push(serde_json::json!({"name": "source", "digest": {"sha256": hex}}));
     }
     for (url, sha) in &spec.fetches {
         materials.push(serde_json::json!({
-            "name": substitute(url, &spec),
+            "name": substitute(url, &spec.primary().name, &spec.version),
             "digest": {"sha256": sha}
         }));
     }
     let provenance = serde_json::json!({
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{
-            "name": spec.name,
+            "name": pkg.name,
             "digest": {"sha256": index_digest.trim_start_matches("sha256:")}
         }],
         "predicateType": "https://slsa.dev/provenance/v1",
@@ -885,10 +919,10 @@ pub fn build(
             "buildDefinition": {
                 "buildType": "https://pkgoci.dev/Pkgocifile/v1",
                 "externalParameters": {
-                    "name": spec.name,
+                    "name": pkg.name,
                     "version": spec.version,
                     "run": spec.run,
-                    "requires": spec.requires,
+                    "requires": pkg.requires,
                 },
                 "resolvedDependencies": materials,
             },
@@ -907,14 +941,11 @@ pub fn build(
         serde_json::to_vec(&provenance)?,
     )?;
 
-    if work != context {
-        let _ = std::fs::remove_dir_all(&work);
-    }
     println!(
         "Built {} {} ({platforms} platform(s), {index_digest})",
-        spec.name, spec.version
+        pkg.name, spec.version
     );
-    println!("Push it with: pkgoci push {}@{}", spec.name, spec.version);
+    println!("Push it with: pkgoci push {}@{}", pkg.name, spec.version);
     Ok(())
 }
 
@@ -935,24 +966,25 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 }
 
 /// Substitute `${PKGOCI_NAME}`/`${PKGOCI_VERSION}` in FETCH urls.
-fn substitute(url: &str, spec: &crate::pkgocifile::Spec) -> String {
-    url.replace("${PKGOCI_NAME}", &spec.name)
-        .replace("${PKGOCI_VERSION}", &spec.version)
+fn substitute(url: &str, name: &str, version: &str) -> String {
+    url.replace("${PKGOCI_NAME}", name)
+        .replace("${PKGOCI_VERSION}", version)
 }
 
-/// Download a digest-pinned source tarball (cached by digest) and extract it
-/// into the build context with the leading path component stripped.
+/// Download a digest-pinned source archive (cached by digest) and extract it
+/// into the build context (see `extract::extract_fetch_archive`).
 fn fetch_source(
     cfg: &Config,
     url: &str,
     sha256: &str,
-    spec: &crate::pkgocifile::Spec,
+    name: &str,
+    version: &str,
     context: &std::path::Path,
 ) -> Result<()> {
     use std::io::Read;
-    let url = substitute(url, spec);
+    let url = substitute(url, name, version);
     std::fs::create_dir_all(cfg.cache())?;
-    let cached = cfg.cache().join(format!("fetch-{sha256}.tar.gz"));
+    let cached = cfg.cache().join(format!("fetch-{sha256}"));
     let bytes = if cached.exists() {
         std::fs::read(&cached)?
     } else {
@@ -971,7 +1003,7 @@ fn fetch_source(
         let _ = std::fs::remove_file(&cached);
         bail!("digest mismatch for {url}: expected {sha256}, got {got}");
     }
-    extract::extract_tar_gz_strip1(&bytes, context)
+    extract::extract_fetch_archive(&bytes, &url, context)
         .with_context(|| format!("extracting {url} into {}", context.display()))
 }
 

@@ -1,0 +1,26 @@
+# kubernetes-cni — CNI network plugins (packaged by Fedora 44 as
+# `containernetworking-plugins`, which `Provides: kubernetes-cni` for
+# kubelet). A REQUIRES of examples/kubernetes's kubelet package.
+NAME kubernetes-cni
+VERSION 1.9.1
+DESCRIPTION Reference and example networking plugins for the Container Network Interface
+LICENSE Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND MIT AND MPL-2.0
+URL https://www.cni.dev
+FETCH https://src.fedoraproject.org/lookaside/pkgs/containernetworking-plugins/plugins-${PKGOCI_VERSION}.tar.gz/sha512/5811fb14786f1f9d9e40741ce337449ce329e14e04213bc660102eb470150f24026e59caec480572e37d0e3e6e6518737f3cc7ac462c47034d0737283ec532f9/plugins-${PKGOCI_VERSION}.tar.gz 34bd82d47e981940751619c9cc44c095bb90bfcaf8d71865cbb822c37690a764
+# go.mod-based projects don't commit vendor/, so Fedora publishes it as a
+# separate archive; FETCH auto-detects that it has no wrapping directory
+# (unlike the source tarball above) and extracts it as-is.
+FETCH https://src.fedoraproject.org/lookaside/pkgs/containernetworking-plugins/plugins-${PKGOCI_VERSION}-vendor.tar.bz2/sha512/6ea06231398525ec94bd42ac579ce2a1987d0febb5d0b872cf8cae82b4dce98d0786f7245e82320eb04ed3f6c9f48a597fa2dd67893e2d8616c1c0836b9eb9cc/plugins-${PKGOCI_VERSION}-vendor.tar.bz2 6caffb2a8c285c6b7aeccc726abae7dba7985375ffe91f07b2d4484eca2fcbe4
+FROM docker.io/library/golang:1.26-bookworm
+ENV GOFLAGS=-mod=vendor
+RUN mkdir -p out/libexec/cni
+RUN for p in plugins/main/bridge plugins/main/dummy plugins/main/host-device \
+    plugins/main/ipvlan plugins/main/loopback plugins/main/macvlan \
+    plugins/main/ptp plugins/main/tap plugins/main/vlan \
+    plugins/ipam/dhcp plugins/ipam/host-local plugins/ipam/static \
+    plugins/meta/bandwidth plugins/meta/firewall plugins/meta/portmap \
+    plugins/meta/sbr plugins/meta/tuning plugins/meta/vrf plugins/sample; \
+    do go build -ldflags "-s -w" -o out/libexec/cni/$(basename $p) ./$p || exit 1; done
+TEST ./out/libexec/cni/bridge 2>&1 | grep -q "CNI bridge plugin"
+TEST ./out/libexec/cni/host-local 2>&1 | grep -q "CNI host-local"
+OUTPUT ./out

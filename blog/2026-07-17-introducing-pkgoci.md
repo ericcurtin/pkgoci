@@ -1,6 +1,7 @@
 # Introducing pkgoci: a package manager where every package is an OCI artifact
 
-*July 17, 2026*
+*July 17, 2026 (updated July 18, 2026 with a heavier stress test: Fedora's
+`kubernetes` spec, and the two Pkgocifile changes it took to build it)*
 
 Today I'm publishing [pkgoci](https://github.com/ericcurtin/pkgoci), a small
 experiment with a big premise: **what if a package manager didn't need any
@@ -158,7 +159,85 @@ Lua 5.4.8  Copyright (C) 1994-2025 Lua.org, PUC-Rio
 Getting there required exactly two additions to the format, `FETCH` (pinned
 upstream sources) and `RUN:<os>` (Lua's `make macosx`/`make linux`/`make
 mingw` build targets), which is the point of testing against real software
-instead of hello-world.
+instead of hello-world. But six single-binary formulas is the easy end of
+the spectrum; the interesting failures show up with something bigger.
+
+### The stress test: Fedora's `kubernetes` spec
+
+So I packaged that too. Fedora 44 builds Kubernetes from one source tree
+into **four** RPMs that must always ship in lockstep — `kubernetes`
+(kubelet), `kubernetes-client` (kubectl), `kubernetes-kubeadm`, and
+`kubernetes-systemd` (kube-apiserver/controller-manager/scheduler/proxy) —
+plus a real runtime dependency, `kubernetes-cni`. Pointing a Pkgocifile at
+the same upstream source and `go-vendor-tools` vendor tree immediately hit
+two gaps:
+
+**One build, several packages.** A Pkgocifile described exactly one
+package. Fedora's spec builds four RPMs from one `%build`; there was no way
+to say that in the format at all short of fetching and compiling the same
+40 MB source tree four separate times. So `NAME` became repeatable: it
+starts a new package, and everything that's genuinely per-package
+(`DESCRIPTION`, `LICENSE`, `REQUIRES`, `OUTPUT`, `PLATFORM`) scopes to
+whichever `NAME` came before it, while the shared build (`VERSION`, `FETCH`,
+`RUN`, `TEST`, `ENV`, `FROM`) runs exactly once:
+
+```dockerfile
+NAME kubernetes
+VERSION 1.36.2
+REQUIRES kubernetes-cni@^1.9
+OUTPUT ./out-kubelet
+
+NAME kubernetes-client
+OUTPUT ./out-client
+
+FETCH https://.../kubernetes-${PKGOCI_VERSION}.tar.gz <sha256>
+FETCH https://.../kubernetes-${PKGOCI_VERSION}-vendor.tar.bz2 <sha256>
+RUN go build -o out-kubelet/bin/kubelet ./cmd/kubelet
+RUN go build -o out-client/bin/kubectl ./cmd/kubectl
+```
+
+`pkgoci build` now fetches and compiles once and packs each `NAME` into its
+own image, so `pkgoci push kubernetes-client` and `pkgoci push kubernetes`
+are independently installable, independently versioned artifacts that were
+still built together from one recipe. And because they share one
+`VERSION`, a bare `REQUIRES kubernetes` on a sibling defined in the same
+file is auto-pinned to that exact version — the same guarantee Fedora's
+spec gets from a page of manual `Conflicts: %{name} < %{version}` lines,
+for free, just from the file's structure.
+
+**FETCH assumed too much.** The existing `FETCH` only handled `.tar.gz` and
+always stripped one leading path component, because that's what a GitHub
+release tarball looks like. Fedora's vendor tarball — the pre-run `go mod
+vendor` output, published separately because go.mod-based projects don't
+commit `vendor/` to git — is `.tar.bz2` and has *no* wrapping directory
+(`vendor/`, `go.work`, `go.mod` sit right at the top). `FETCH` now decodes
+`.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.zst`/`.tzst`, and bare `.tar`,
+and only strips a leading component when every entry in the archive
+actually shares one — so both shapes just work, with no new syntax to
+learn for the common case.
+
+With those two changes, the whole thing builds: kubelet, kubectl, kubeadm,
+kube-apiserver, kube-controller-manager, kube-scheduler, and kube-proxy, all
+compiled from Fedora's real upstream source and vendor tree, network-denied
+throughout (the sandbox only ever touches the network during the digest-pinned
+`FETCH`, before the build starts):
+
+```text
+$ pkgoci install kubernetes-client kubernetes-kubeadm kubernetes-systemd
+...
+$ kubectl version --client && kubeadm version
+Client Version: v1.36.2
+kubeadm version: &version.Info{GitVersion:"v1.36.2", ...}
+$ pkgoci info kubernetes-kubeadm
+Requires: kubernetes-cni@^1.9, kubernetes@1.36.2
+```
+
+(pkgoci has no service manager — no systemd units, no `/etc` — so unlike
+Fedora's RPMs this only ever installs the binaries; wiring up kubelet or
+kube-apiserver as a system service is left to the host, same as it would be
+for anything you `go install`ed by hand. The full recipe, dependency
+included, is `examples/kubernetes/Pkgocifile` and
+`examples/kubernetes-cni/Pkgocifile` in the repo.)
 
 ## Signatures and build provenance, cosign-verifiable
 
